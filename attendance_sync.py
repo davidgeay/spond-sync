@@ -1,77 +1,81 @@
 # attendance_sync.py
-# Requirements installed by the workflow: spond gspread google-auth pandas openpyxl
+# Requirements: spond gspread google-auth pandas openpyxl
 #
-# Secrets required in the repo:
+# Secrets required (GitHub > Settings > Secrets and variables > Actions):
 #   SPOND_USERNAME, SPOND_PASSWORD, GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID
 #
-# Optional env (already set in the workflow below):
-#   TIMEZONE  -> local tz for weekday/time filtering (default Europe/Oslo)
+# Rules:
+#   - Only Spond group named "IHKS G2008b/G2009b"
+#   - Date range: from 2025-08-01 up to time of sync
+#   - Weekdays only: Monday–Friday
+#   - Local time window: 19:00–23:00 (inclusive), using TIMEZONE (default Europe/Oslo)
+#   - No filtering by event title
 
 import os, io, json, asyncio
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from spond import spond
 
-# ---------- CONFIG ----------
-GROUP_NAME_FILTER = "IHKS G2008b/G2009b"   # exact group to sync
-LOCAL_TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Oslo"))
+# -------- Configuration --------
+GROUP_NAME = "IHKS G2008b/G2009b"
+TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Oslo"))
 
-# Date window: from 1 Aug 2025 (local midnight) up to now
-DATE_MIN_LOCAL = datetime(2025, 8, 1, 0, 0, 0, tzinfo=LOCAL_TZ)
+DATE_MIN_LOCAL = datetime(2025, 8, 1, 0, 0, 0, tzinfo=TIMEZONE)
 DATE_MIN_UTC = DATE_MIN_LOCAL.astimezone(timezone.utc)
 DATE_MAX_UTC = datetime.now(timezone.utc)
 
-# Time-of-day window in LOCAL_TZ (inclusive)
-WINDOW_START = time(19, 0)   # 19:00
-WINDOW_END   = time(21, 30)  # 21:30
+WINDOW_START = time(19, 0)    # 19:00 (inclusive)
+WINDOW_END   = time(23, 0)    # 23:00 (inclusive)
 
-# Weekdays allowed (Mon=0 ... Sun=6)
-ALLOWED_WEEKDAYS = {0, 1, 2, 3, 4}
+ALLOWED_WEEKDAYS = {0, 1, 2, 3, 4}  # Mon=0 ... Fri=4
 
-SHEET_TAB = "Attendance"
+ATT_TAB  = "Attendance"
+DBG_TAB  = "Debug"
 
-ALL_COLUMNS = [
+ATT_COLUMNS = [
     "Event ID", "Event Title", "Event Start (UTC)",
     "Member", "Status", "Raw Status", "Raw Reason",
     "Override Status", "Override Reason",
 ]
-# ---------------------------
+# --------------------------------
 
 def log(msg: str): print(f"[spond-sync] {msg}", flush=True)
 
-def auth_sheets() -> gspread.Client:
-    info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+# ---------- Google Sheets ----------
+def sheets_client() -> gspread.Client:
+    svc_json = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     creds = Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        svc_json, scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
     return gspread.authorize(creds)
 
-def get_ws(gc: gspread.Client):
-    sh = gc.open_by_key(os.environ["SHEET_ID"])
+def open_spreadsheet(gc: gspread.Client):
+    return gc.open_by_key(os.environ["SHEET_ID"])
+
+def get_or_create_ws(sh, title: str):
     try:
-        return sh.worksheet(SHEET_TAB)
+        return sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        return sh.add_worksheet(title=SHEET_TAB, rows=2000, cols=20)
+        return sh.add_worksheet(title=title, rows=2000, cols=20)
     except gspread.exceptions.APIError as e:
-        # If API races: fall back to fetching it
         if "already exists" in str(e).lower():
-            return sh.worksheet(SHEET_TAB)
+            return sh.worksheet(title)
         raise
 
-def _extract(d: Dict[str, Any], *keys):
+# ---------- Spond helpers ----------
+def _pick(d: Dict[str, Any], *keys):
     for k in keys:
         if k in d and d[k] is not None:
             return d[k]
     return None
 
-def parse_event_start(any_dict: Dict[str, Any]) -> Optional[datetime]:
-    raw = _extract(any_dict,
+def parse_start_utc(any_dict: Dict[str, Any]) -> Optional[datetime]:
+    raw = _pick(any_dict,
         "startTimeUtc", "start_time_utc", "startTime", "start",
         "startAt", "start_at", "startDateTime", "start_datetime"
     )
@@ -86,21 +90,34 @@ def parse_event_start(any_dict: Dict[str, Any]) -> Optional[datetime]:
     except Exception:
         return None
 
-def within_rules(start_utc: datetime) -> bool:
-    """Apply weekday + time window (in LOCAL_TZ) and the date window."""
+def within_rules(start_utc: datetime) -> Tuple[bool, Dict[str, Any]]:
+    """Return (included?, debug_fields)."""
     if start_utc.tzinfo is None:
         start_utc = start_utc.replace(tzinfo=timezone.utc)
-    # Date window (UTC, then reconfirm in local just to be safe)
-    if not (DATE_MIN_UTC <= start_utc <= DATE_MAX_UTC):
-        return False
 
-    local = start_utc.astimezone(LOCAL_TZ)
-    if local.weekday() not in ALLOWED_WEEKDAYS:
-        return False
+    # Date window check (UTC)
+    in_date = DATE_MIN_UTC <= start_utc <= DATE_MAX_UTC
 
-    # Inclusive time window
+    local = start_utc.astimezone(TIMEZONE)
+    wd = local.weekday()
+    in_weekday = wd in ALLOWED_WEEKDAYS
+
     t = local.time()
-    return (t >= WINDOW_START) and (t <= WINDOW_END)
+    in_time = (t >= WINDOW_START) and (t <= WINDOW_END)
+
+    included = in_date and in_weekday and in_time
+    window_label = f"Time {WINDOW_START.strftime('%H:%M')}-{WINDOW_END.strftime('%H:%M')} OK"
+    debug = {
+        "Start UTC": start_utc.isoformat(),
+        "Start Local": local.isoformat(),
+        "Local Weekday (0=Mon)": wd,
+        "Local Time": local.strftime("%H:%M"),
+        "In Date Window": "Yes" if in_date else "No",
+        "Weekday OK": "Yes" if in_weekday else "No",
+        window_label: "Yes" if in_time else "No",
+        "Included": "Yes" if included else "No",
+    }
+    return included, debug
 
 def normalize_status(raw: str) -> str:
     r = (raw or "").strip().lower()
@@ -115,10 +132,8 @@ def normalize_status(raw: str) -> str:
     return (raw or "").strip()
 
 def read_attendance_xlsx(xlsx_bytes: bytes) -> pd.DataFrame:
-    # Let pandas infer the table; Spond exports vary a bit by locale/template
+    # Read first sheet; Spond formats vary a bit
     df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=0)
-
-    # Normalize column names
     df.columns = [str(c).strip() for c in df.columns]
 
     def pick(*opts):
@@ -136,15 +151,11 @@ def read_attendance_xlsx(xlsx_bytes: bytes) -> pd.DataFrame:
         return pd.DataFrame(columns=["Member", "Raw Status", "Raw Reason"])
 
     slim = df[keep].copy()
-    slim.rename(columns={name_col: "Member"} if name_col else {}, inplace=True)
-    if status_col:
-        slim.rename(columns={status_col: "Raw Status"}, inplace=True)
-    else:
-        slim["Raw Status"] = ""
-    if reason_col:
-        slim.rename(columns={reason_col: "Raw Reason"}, inplace=True)
-    else:
-        slim["Raw Reason"] = ""
+    if name_col:   slim.rename(columns={name_col: "Member"}, inplace=True)
+    if status_col: slim.rename(columns={status_col: "Raw Status"}, inplace=True)
+    else:          slim["Raw Status"] = ""
+    if reason_col: slim.rename(columns={reason_col: "Raw Reason"}, inplace=True)
+    else:          slim["Raw Reason"] = ""
 
     for c in ["Member", "Raw Status", "Raw Reason"]:
         if c in slim.columns:
@@ -152,33 +163,34 @@ def read_attendance_xlsx(xlsx_bytes: bytes) -> pd.DataFrame:
 
     return slim[["Member", "Raw Status", "Raw Reason"]]
 
-async def fetch_group_id(sp: spond.Spond) -> Optional[str]:
+async def resolve_group_id(sp: spond.Spond) -> Optional[str]:
     groups = await sp.get_groups()
     log(f"Found {len(groups)} groups.")
     gid = None
     for g in groups:
-        gname = _extract(g, "name", "title", "groupName") or ""
-        this_id = _extract(g, "id", "groupId", "uid")
+        gname = _pick(g, "name", "title", "groupName") or ""
+        this_id = _pick(g, "id", "groupId", "uid")
         log(f"  - {this_id} | {gname}")
-        if gname.strip().lower() == GROUP_NAME_FILTER.strip().lower():
+        if gname.strip().lower() == GROUP_NAME.strip().lower():
             gid = this_id
     if gid:
-        log(f"Using group: {GROUP_NAME_FILTER} (id={gid})")
+        log(f"Using group: {GROUP_NAME} (id={gid})")
     else:
-        log(f"ERROR: Group '{GROUP_NAME_FILTER}' not found.")
+        log(f"ERROR: Group '{GROUP_NAME}' not found.")
     return gid
 
-async def fetch_rows() -> List[Dict[str, Any]]:
+# ---------- Fetch & Build Rows ----------
+async def fetch_rows() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     username = os.environ["SPOND_USERNAME"]
     password = os.environ["SPOND_PASSWORD"]
     sp = spond.Spond(username=username, password=password)
 
-    gid = await fetch_group_id(sp)
+    gid = await resolve_group_id(sp)
     if not gid:
         await sp.clientsession.close()
-        return []
+        return [], []
 
-    log(f"Fetching events (UTC window {DATE_MIN_UTC.isoformat()} → {DATE_MAX_UTC.isoformat()}) ...")
+    log(f"Fetching events (UTC {DATE_MIN_UTC.isoformat()} → {DATE_MAX_UTC.isoformat()}) ...")
     try:
         events = await sp.get_events(
             group_id=gid,
@@ -188,43 +200,63 @@ async def fetch_rows() -> List[Dict[str, Any]]:
             max_events=500
         )
     except TypeError:
-        # Older lib: no group_id param on get_events; fetch all then filter
+        # Older lib: no group_id on get_events
         events = await sp.get_events(min_start=DATE_MIN_UTC, max_start=DATE_MAX_UTC)
 
     log(f"Fetched {len(events)} events (list view may be minimal).")
 
-    out_rows: List[Dict[str, Any]] = []
-    checked = 0
+    att_rows: List[Dict[str, Any]] = []
+    dbg_rows: List[Dict[str, Any]] = []
 
     for ev in events:
-        eid = _extract(ev, "id", "eventId", "uid")
+        eid = _pick(ev, "id", "eventId", "uid")
         if not eid:
             continue
 
-        # Always fetch full details to get reliable start time
+        # Full details for reliable fields
         try:
             details = await sp.get_event(eid)
         except Exception as e:
             log(f"WARNING: get_event failed for {eid}: {e}")
             continue
 
-        checked += 1
-        title = _extract(details, "title", "name", "eventName", "subject") or ""
-        start_utc = parse_event_start(details)
+        title = _pick(details, "title", "name", "eventName", "subject") or ""
+        start_utc = parse_start_utc(details)
         start_disp = start_utc.isoformat() if start_utc else "NO-START"
         log(f"  • {eid} | {title or 'NO-TITLE'} | {start_disp}")
 
-        if not start_utc or not within_rules(start_utc):
+        if start_utc:
+            include, dbg = within_rules(start_utc)
+        else:
+            include = False
+            dbg = {
+                "Start UTC": "NO-START",
+                "Start Local": "",
+                "Local Weekday (0=Mon)": "",
+                "Local Time": "",
+                "In Date Window": "No",
+                "Weekday OK": "No",
+                f"Time {WINDOW_START.strftime('%H:%M')}-{WINDOW_END.strftime('%H:%M')} OK": "No",
+                "Included": "No",
+            }
+
+        dbg_rows.append({
+            "Event ID": eid,
+            "Event Title": title,
+            **dbg
+        })
+
+        if not include:
             continue
 
-        # Pull attendance XLSX (preferred)
+        # Attendance table (prefer XLSX)
         try:
             xlsx = await sp.get_event_attendance_xlsx(eid)
             table = read_attendance_xlsx(xlsx)
         except Exception as e:
             log(f"WARNING: XLSX not available for {eid}: {e}")
             table = pd.DataFrame(columns=["Member", "Raw Status", "Raw Reason"])
-            # Fallback: participants structure if present
+            # Fallback: participants structure, if any
             participants = details.get("participants") or details.get("members") or []
             for p in participants:
                 table.loc[len(table)] = [
@@ -237,8 +269,6 @@ async def fetch_rows() -> List[Dict[str, Any]]:
             continue
 
         table["Status"] = table["Raw Status"].map(normalize_status)
-
-        # Assemble final columns
         table.insert(0, "Event ID", eid)
         table.insert(1, "Event Title", title)
         table.insert(2, "Event Start (UTC)", start_utc.isoformat())
@@ -248,34 +278,32 @@ async def fetch_rows() -> List[Dict[str, Any]]:
         if "Override Reason" not in table.columns:
             table["Override Reason"] = ""
 
-        table = table[[
-            "Event ID", "Event Title", "Event Start (UTC)",
-            "Member", "Status", "Raw Status", "Raw Reason",
-            "Override Status", "Override Reason",
-        ]]
+        table = table[ATT_COLUMNS]
+        att_rows.extend(table.to_dict(orient="records"))
 
-        out_rows.extend(table.to_dict(orient="records"))
+    # Close http session
+    if hasattr(sp, "clientsession") and sp.clientsession:
+        await sp.clientsession.close()
 
-    await sp.clientsession.close()
-    log(f"Checked details for {checked} events.")
-    log(f"Prepared {len(out_rows)} rows.")
-    return out_rows
+    log(f"Prepared {len(att_rows)} attendance rows.")
+    return att_rows, dbg_rows
 
-def upsert_to_sheet(ws, rows: List[Dict[str, Any]]):
-    """Write full header always; keep your manual overrides when re-syncing."""
+# ---------- Write to Sheets ----------
+def upsert_attendance(ws, rows: List[Dict[str, Any]]):
+    """Write full header always; preserve override columns by (Event ID + Member)."""
     existing = ws.get_all_records()
-    existing_df = pd.DataFrame(existing) if existing else pd.DataFrame(columns=ALL_COLUMNS)
+    existing_df = pd.DataFrame(existing) if existing else pd.DataFrame(columns=ATT_COLUMNS)
     new_df = pd.DataFrame(rows)
 
     if new_df.empty:
-        new_df = pd.DataFrame(columns=ALL_COLUMNS)
+        new_df = pd.DataFrame(columns=ATT_COLUMNS)
     else:
-        for col in ALL_COLUMNS:
+        for col in ATT_COLUMNS:
             if col not in new_df.columns:
                 new_df[col] = ""
-        new_df = new_df[ALL_COLUMNS]
+        new_df = new_df[ATT_COLUMNS]
 
-        # Preserve overrides by (Event ID + Member)
+        # Preserve overrides
         key = ["Event ID", "Member"]
         for col in ["Override Status", "Override Reason"]:
             if col in existing_df.columns:
@@ -291,21 +319,52 @@ def upsert_to_sheet(ws, rows: List[Dict[str, Any]]):
                 )
                 new_df = merged.drop(columns=[f"{col}_old"])
 
-    # Sort by date then member (nice to read)
+    # Sort by date then member
     if "Event Start (UTC)" in new_df.columns:
         new_df["_dt"] = pd.to_datetime(new_df["Event Start (UTC)"], errors="coerce", utc=True)
         new_df.sort_values(by=["_dt", "Member"], inplace=True)
         new_df.drop(columns=["_dt"], inplace=True)
 
     ws.clear()
-    ws.update([ALL_COLUMNS] + new_df.fillna("").values.tolist())
-    log("Sheet updated.")
+    ws.update([ATT_COLUMNS] + new_df.fillna("").values.tolist())
+    log("Attendance sheet updated.")
 
+def write_debug(ws_dbg, dbg_rows: List[Dict[str, Any]]):
+    if not dbg_rows:
+        # Write header with a hint row
+        cols = [
+            "Event ID","Event Title","Start UTC","Start Local","Local Weekday (0=Mon)",
+            "Local Time","In Date Window","Weekday OK",f"Time {WINDOW_START.strftime('%H:%M')}-{WINDOW_END.strftime('%H:%M')} OK","Included"
+        ]
+        ws_dbg.clear()
+        ws_dbg.update([cols, ["(no events found in API window)", "", "", "", "", "", "", "", "", ""]])
+        log("Debug sheet updated (no events).")
+        return
+
+    # Build a stable column order
+    all_keys = [
+        "Event ID","Event Title","Start UTC","Start Local","Local Weekday (0=Mon)",
+        "Local Time","In Date Window","Weekday OK",f"Time {WINDOW_START.strftime('%H:%M')}-{WINDOW_END.strftime('%H:%M')} OK","Included"
+    ]
+    rows = []
+    for r in dbg_rows:
+        rows.append([r.get(k, "") for k in all_keys])
+
+    ws_dbg.clear()
+    ws_dbg.update([all_keys] + rows)
+    log("Debug sheet updated.")
+
+# ---------- Entrypoint ----------
 async def main():
-    gc = auth_sheets()
-    ws = get_ws(gc)
-    rows = await fetch_rows()
-    upsert_to_sheet(ws, rows)
+    gc = sheets_client()
+    sh = open_spreadsheet(gc)
+    ws_att = get_or_create_ws(sh, ATT_TAB)
+    ws_dbg = get_or_create_ws(sh, DBG_TAB)
+
+    att_rows, dbg_rows = await fetch_rows()
+    upsert_attendance(ws_att, att_rows)
+    write_debug(ws_dbg, dbg_rows)
+    log("Sync complete.")
 
 if __name__ == "__main__":
     asyncio.run(main())
