@@ -3,7 +3,7 @@ name: Spond Attendance Sync
 on:
   schedule:
     - cron: "0 * * * *"   # every hour
-  workflow_dispatch:       # allow manual run
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -25,7 +25,10 @@ jobs:
       - name: Run sync
         env:
           PYTHONUNBUFFERED: "1"
-          MATCH_MODE: "iexact"   # tolerant title match (case/extra spaces)
+          MATCH_MODE: "iexact"          # event-title matching (case/space tolerant)
+          GROUP_MATCH_MODE: "iexact"    # group-name matching (case/space tolerant)
+          EVENT_NAME_FILTER: "Istrening U18B"
+          GROUP_NAME_FILTER: "IHKS G2008b/G2009b"
           SPOND_USERNAME: ${{ secrets.SPOND_USERNAME }}
           SPOND_PASSWORD: ${{ secrets.SPOND_PASSWORD }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
