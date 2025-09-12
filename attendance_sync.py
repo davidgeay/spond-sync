@@ -2,7 +2,7 @@
 # Sync Spond attendance -> Google Sheets (one row per member per event)
 #
 # pip install: spond gspread google-auth pandas openpyxl
-# Secrets required: SPOND_USERNAME, SPOND_PASSWORD, GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID
+# Secrets: SPOND_USERNAME, SPOND_PASSWORD, GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID
 
 import os, json, asyncio, io, traceback
 from datetime import datetime, timezone, timedelta
@@ -14,13 +14,17 @@ from spond import spond
 # ---------- SETTINGS ----------
 SHEET_ID = os.environ["SHEET_ID"]
 TAB_NAME = "Attendance"
-EVENT_NAME_FILTER = "Istrening U18B"
+
+# Filters
+EVENT_NAME_FILTER = os.environ.get("EVENT_NAME_FILTER", "Istrening U18B")
+GROUP_NAME_FILTER = os.environ.get("GROUP_NAME_FILTER", "IHKS G2008b/G2009b")
 
 # Include events ON/AFTER this timestamp (inclusive)
 EVENT_START_MIN = datetime(2025, 7, 1, 0, 0, 0, tzinfo=timezone.utc)
 
-# Title matching mode: exact | iexact | contains | startswith
+# Title/group matching modes: exact | iexact | contains | startswith
 MATCH_MODE = os.environ.get("MATCH_MODE", "iexact")
+GROUP_MATCH_MODE = os.environ.get("GROUP_MATCH_MODE", "iexact")
 # ------------------------------
 
 HEADER = [
@@ -33,17 +37,14 @@ TRUTHY = {"true","yes","1","y","ja","t"}
 def log(msg: str): print(f"[spond-sync] {msg}", flush=True)
 
 def _norm(s: str) -> str:
+    # collapse inner spaces, strip ends, lower
     return " ".join((s or "").split()).strip().lower()
 
-def title_matches(title: str, pattern: str) -> bool:
-    if MATCH_MODE == "exact":
-        return (title or "") == (pattern or "")
-    if MATCH_MODE == "iexact":
-        return _norm(title) == _norm(pattern)
-    if MATCH_MODE == "contains":
-        return _norm(pattern) in _norm(title)
-    if MATCH_MODE == "startswith":
-        return _norm(title).startswith(_norm(pattern))
+def matches(title: str, pattern: str, mode: str) -> bool:
+    if mode == "exact":       return (title or "") == (pattern or "")
+    if mode == "iexact":      return _norm(title) == _norm(pattern)
+    if mode == "contains":    return _norm(pattern) in _norm(title)
+    if mode == "startswith":  return _norm(title).startswith(_norm(pattern))
     return _norm(title) == _norm(pattern)
 
 def sheets_client_from_env():
@@ -69,7 +70,7 @@ def get_ws(gc):
     for ws in sh.worksheets():
         if ws.title == TAB_NAME or ws.title.strip().lower() == wanted:
             return ws
-    # 3) Create if truly missing; if API says exists, return the matched one
+    # 3) Create if missing; if API says exists, return it
     try:
         return sh.add_worksheet(title=TAB_NAME, rows=2000, cols=20)
     except gspread.exceptions.APIError as e:
@@ -111,29 +112,83 @@ def parse_event_start_iso(ev):
     except Exception:
         return raw, None
 
+async def pick_group(s: spond.Spond):
+    """Return (group_id, group_name) for the requested GROUP_NAME_FILTER, or (None, None)."""
+    try:
+        groups = await s.get_groups()
+    except Exception as e:
+        log(f"WARNING: could not list groups: {e}")
+        groups = []
+
+    log(f"Found {len(groups)} groups on account.")
+    for g in groups[:20]:
+        log(f"  - {g.get('id')} | {g.get('name') or g.get('title')}")
+
+    # Try to match by name first
+    for g in groups:
+        gname = g.get("name") or g.get("title") or ""
+        if matches(gname, GROUP_NAME_FILTER, GROUP_MATCH_MODE):
+            return (g.get("id"), gname)
+
+    # No direct name match; return None and we'll filter by name on events
+    return (None, None)
+
+def event_in_group(ev, wanted_group_id, wanted_group_name):
+    """Check group by id or by name on the event object."""
+    if ev is None:
+        return False
+    gid = ev.get("groupId") or (ev.get("group") or {}).get("id") or ev.get("group_id")
+    gname = (ev.get("group") or {}).get("name") or ev.get("groupName") or ev.get("group_title") or ""
+    if wanted_group_id and gid and str(gid) == str(wanted_group_id):
+        return True
+    if wanted_group_name and matches(gname, wanted_group_name, GROUP_MATCH_MODE):
+        return True
+    return False
+
 async def fetch_attendance_rows():
     username = os.environ["SPOND_USERNAME"]
     password = os.environ["SPOND_PASSWORD"]
     s = spond.Spond(username=username, password=password)
 
-    # Ask wide; still hard-filter locally. Datetimes required by lib:
-    min_start = EVENT_START_MIN  # inclusive on API side too
+    # Select the group
+    wanted_gid, matched_gname = await pick_group(s)
+    if matched_gname:
+        log(f"Using group: {matched_gname} (id={wanted_gid})")
+    else:
+        log(f"Group '{GROUP_NAME_FILTER}' not found by name; will filter by name on events.")
+
+    # Ask wide; still hard-filter locally
+    min_start = EVENT_START_MIN  # inclusive
     max_start = datetime.now(timezone.utc) + timedelta(days=365)
 
     log(f"Fetching events (min_start={min_start.isoformat()}, max_start={max_start.isoformat()}) ...")
-    events = await s.get_events(min_start=min_start, max_start=max_start)
-    log(f"Fetched {len(events or [])} events total.")
+    try:
+        # Some library versions support group_id; if not, we'll fall back
+        events = await s.get_events(min_start=min_start, max_start=max_start, group_id=wanted_gid) if wanted_gid else await s.get_events(min_start=min_start, max_start=max_start)
+    except TypeError:
+        # Fallback: call without group filter and filter locally
+        events = await s.get_events(min_start=min_start, max_start=max_start)
+
+    total = len(events or [])
+    log(f"Fetched {total} events total.")
     for ev in (events or [])[:25]:
         raw_start = ev.get("startTimeUtc") or ev.get("startTime") or ""
-        log(f"  - {ev.get('id')} | {ev.get('title')} | {raw_start}")
-    matches = [ev for ev in (events or []) if title_matches(ev.get('title',''), EVENT_NAME_FILTER)]
-    log(f"Title matches for '{EVENT_NAME_FILTER}' ({MATCH_MODE}): {len(matches)}")
+        gname = (ev.get("group") or {}).get("name") or ev.get("groupName") or ""
+        log(f"  - {ev.get('id')} | {ev.get('title')} | {gname} | {raw_start}")
+
+    # Group filter (ID or name)
+    events = [ev for ev in (events or []) if event_in_group(ev, wanted_gid, GROUP_NAME_FILTER)]
+    log(f"After group filter '{GROUP_NAME_FILTER}': {len(events)} events")
+
+    # Title filter
+    title_matches = [ev for ev in events if matches(ev.get('title',''), EVENT_NAME_FILTER, MATCH_MODE)]
+    log(f"Title matches for '{EVENT_NAME_FILTER}' ({MATCH_MODE}): {len(title_matches)}")
 
     rows = []
-    for ev in matches:
+    for ev in title_matches:
         title = (ev.get("title") or "").strip()
         start_iso, start_dt = parse_event_start_iso(ev)
-        # Inclusive cutoff: keep events with start >= EVENT_START_MIN
+        # Inclusive cutoff: start >= EVENT_START_MIN
         if not start_dt:
             log(f"Skip {ev.get('id')}: no start time parsed.")
             continue
