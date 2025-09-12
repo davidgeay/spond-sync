@@ -1,27 +1,29 @@
 # attendance_sync.py
-# Requirements: spond gspread google-auth pandas openpyxl
+# Requirements (installed by workflow): spond gspread google-auth pandas openpyxl python-dateutil
 #
-# Secrets required (GitHub > Settings > Secrets and variables > Actions):
+# GitHub Secrets needed:
 #   SPOND_USERNAME, SPOND_PASSWORD, GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID
 #
-# Rules:
-#   - Only Spond group named "IHKS G2008b/G2009b"
-#   - Date range: from 2025-08-01 up to time of sync
-#   - Weekdays only: Monday–Friday
-#   - Local time window: 19:00–23:00 (inclusive), using TIMEZONE (default Europe/Oslo)
-#   - No filtering by event title
+# Behavior:
+#   - Only group named "IHKS G2008b/G2009b"
+#   - Date window: from 2025-08-01 (inclusive) up to time of sync (UTC now)
+#   - Include an event if the word "istrening" appears ANYWHERE (case-insensitive)
+#       * title, description/notes/message/text/location/category
+#       * OR in the attendance XLSX header text (fallback)
+#   - No weekday or time-of-day filtering
+#   - Sheet tabs: "Attendance" (data) and "Debug" (diagnostics)
 
-import os, io, json, asyncio
-from datetime import datetime, time, timezone
+import os, io, json, asyncio, re
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from dateutil import parser as dtparser
 import gspread
 from google.oauth2.service_account import Credentials
 from spond import spond
 
-# -------- Configuration --------
 GROUP_NAME = "IHKS G2008b/G2009b"
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Oslo"))
 
@@ -29,24 +31,21 @@ DATE_MIN_LOCAL = datetime(2025, 8, 1, 0, 0, 0, tzinfo=TIMEZONE)
 DATE_MIN_UTC = DATE_MIN_LOCAL.astimezone(timezone.utc)
 DATE_MAX_UTC = datetime.now(timezone.utc)
 
-WINDOW_START = time(19, 0)    # 19:00 (inclusive)
-WINDOW_END   = time(23, 0)    # 23:00 (inclusive)
-
-ALLOWED_WEEKDAYS = {0, 1, 2, 3, 4}  # Mon=0 ... Fri=4
-
-ATT_TAB  = "Attendance"
-DBG_TAB  = "Debug"
+ATT_TAB = "Attendance"
+DBG_TAB = "Debug"
 
 ATT_COLUMNS = [
     "Event ID", "Event Title", "Event Start (UTC)",
     "Member", "Status", "Raw Status", "Raw Reason",
     "Override Status", "Override Reason",
 ]
-# --------------------------------
+
+ISTR_PAT = re.compile(r"\bistrening\b", re.IGNORECASE)
 
 def log(msg: str): print(f"[spond-sync] {msg}", flush=True)
 
-# ---------- Google Sheets ----------
+# ---------------- Google Sheets ----------------
+
 def sheets_client() -> gspread.Client:
     svc_json = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     creds = Credentials.from_service_account_info(
@@ -67,15 +66,16 @@ def get_or_create_ws(sh, title: str):
             return sh.worksheet(title)
         raise
 
-# ---------- Spond helpers ----------
+# ---------------- Spond helpers ----------------
+
 def _pick(d: Dict[str, Any], *keys):
     for k in keys:
         if k in d and d[k] is not None:
             return d[k]
     return None
 
-def parse_start_utc(any_dict: Dict[str, Any]) -> Optional[datetime]:
-    raw = _pick(any_dict,
+def parse_start_utc(d: Dict[str, Any]) -> Optional[datetime]:
+    raw = _pick(d,
         "startTimeUtc", "start_time_utc", "startTime", "start",
         "startAt", "start_at", "startDateTime", "start_datetime"
     )
@@ -90,49 +90,39 @@ def parse_start_utc(any_dict: Dict[str, Any]) -> Optional[datetime]:
     except Exception:
         return None
 
-def within_rules(start_utc: datetime) -> Tuple[bool, Dict[str, Any]]:
-    """Return (included?, debug_fields)."""
-    if start_utc.tzinfo is None:
-        start_utc = start_utc.replace(tzinfo=timezone.utc)
+def contains_istrening(*texts: Optional[str]) -> bool:
+    for t in texts:
+        if t and ISTR_PAT.search(t):
+            return True
+    return False
 
-    # Date window check (UTC)
-    in_date = DATE_MIN_UTC <= start_utc <= DATE_MAX_UTC
+def parse_datetime_from_text(text: str) -> Optional[datetime]:
+    """Try to parse a datetime from free text (XLSX header, etc.)."""
+    try:
+        dt = dtparser.parse(text, fuzzy=True, dayfirst=True)
+        if dt.tzinfo is None:
+            dt = TIMEZONE.localize(dt) if hasattr(TIMEZONE, "localize") else dt.replace(tzinfo=TIMEZONE)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
-    local = start_utc.astimezone(TIMEZONE)
-    wd = local.weekday()
-    in_weekday = wd in ALLOWED_WEEKDAYS
-
-    t = local.time()
-    in_time = (t >= WINDOW_START) and (t <= WINDOW_END)
-
-    included = in_date and in_weekday and in_time
-    window_label = f"Time {WINDOW_START.strftime('%H:%M')}-{WINDOW_END.strftime('%H:%M')} OK"
-    debug = {
-        "Start UTC": start_utc.isoformat(),
-        "Start Local": local.isoformat(),
-        "Local Weekday (0=Mon)": wd,
-        "Local Time": local.strftime("%H:%M"),
-        "In Date Window": "Yes" if in_date else "No",
-        "Weekday OK": "Yes" if in_weekday else "No",
-        window_label: "Yes" if in_time else "No",
-        "Included": "Yes" if included else "No",
-    }
-    return included, debug
-
-def normalize_status(raw: str) -> str:
-    r = (raw or "").strip().lower()
-    if r in {"yes", "attending", "accepted", "present"}:
-        return "Present"
-    if r in {"no", "declined", "absent"}:
-        return "Absent"
-    if "late" in r:
-        return "Late"
-    if r in {"unknown", "maybe", "no response"}:
-        return "No response"
-    return (raw or "").strip()
+def xlsx_header_text(xlsx_bytes: bytes) -> str:
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+        ws = wb.active
+        lines = []
+        for r in ws.iter_rows(min_row=1, max_row=12, values_only=True):
+            for cell in r:
+                if isinstance(cell, str):
+                    c = cell.strip()
+                    if c:
+                        lines.append(c)
+        return "\n".join(lines)
+    except Exception:
+        return ""
 
 def read_attendance_xlsx(xlsx_bytes: bytes) -> pd.DataFrame:
-    # Read first sheet; Spond formats vary a bit
     df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=0)
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -163,6 +153,20 @@ def read_attendance_xlsx(xlsx_bytes: bytes) -> pd.DataFrame:
 
     return slim[["Member", "Raw Status", "Raw Reason"]]
 
+def normalize_status(raw: str) -> str:
+    r = (raw or "").strip().lower()
+    if r in {"yes", "attending", "accepted", "present"}:
+        return "Present"
+    if r in {"no", "declined", "absent"}:
+        return "Absent"
+    if "late" in r:
+        return "Late"
+    if r in {"unknown", "maybe", "no response"}:
+        return "No response"
+    return (raw or "").strip()
+
+# ---------------- Core logic ----------------
+
 async def resolve_group_id(sp: spond.Spond) -> Optional[str]:
     groups = await sp.get_groups()
     log(f"Found {len(groups)} groups.")
@@ -179,8 +183,10 @@ async def resolve_group_id(sp: spond.Spond) -> Optional[str]:
         log(f"ERROR: Group '{GROUP_NAME}' not found.")
     return gid
 
-# ---------- Fetch & Build Rows ----------
 async def fetch_rows() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Returns (attendance_rows, debug_rows)
+    """
     username = os.environ["SPOND_USERNAME"]
     password = os.environ["SPOND_PASSWORD"]
     sp = spond.Spond(username=username, password=password)
@@ -200,10 +206,9 @@ async def fetch_rows() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
             max_events=500
         )
     except TypeError:
-        # Older lib: no group_id on get_events
         events = await sp.get_events(min_start=DATE_MIN_UTC, max_start=DATE_MAX_UTC)
 
-    log(f"Fetched {len(events)} events (list view may be minimal).")
+    log(f"Fetched {len(events)} events (list may be minimal).")
 
     att_rows: List[Dict[str, Any]] = []
     dbg_rows: List[Dict[str, Any]] = []
@@ -213,7 +218,7 @@ async def fetch_rows() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         if not eid:
             continue
 
-        # Full details for reliable fields
+        # Always fetch details
         try:
             details = await sp.get_event(eid)
         except Exception as e:
@@ -221,42 +226,65 @@ async def fetch_rows() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
             continue
 
         title = _pick(details, "title", "name", "eventName", "subject") or ""
-        start_utc = parse_start_utc(details)
+        desc  = _pick(details, "description", "notes", "message", "text") or ""
+        where = _pick(details, "location", "place", "venue", "address") or ""
+        categ = _pick(details, "category", "type") or ""
+
+        start_utc = parse_start_utc(details)  # we still need this for the cut-off
         start_disp = start_utc.isoformat() if start_utc else "NO-START"
         log(f"  • {eid} | {title or 'NO-TITLE'} | {start_disp}")
 
-        if start_utc:
-            include, dbg = within_rules(start_utc)
-        else:
-            include = False
-            dbg = {
-                "Start UTC": "NO-START",
-                "Start Local": "",
-                "Local Weekday (0=Mon)": "",
-                "Local Time": "",
-                "In Date Window": "No",
-                "Weekday OK": "No",
-                f"Time {WINDOW_START.strftime('%H:%M')}-{WINDOW_END.strftime('%H:%M')} OK": "No",
-                "Included": "No",
-            }
+        matched_source = ""
+        included = False
+        resolved_start = start_utc
+
+        # 1) Direct fields contains 'istrening'?
+        if contains_istrening(title, desc, where, categ):
+            matched_source = "fields"
+            included = True
+
+        # 2) If not matched yet, look at XLSX header text
+        header_text = ""
+        if not included:
+            try:
+                xlsx = await sp.get_event_attendance_xlsx(eid)
+                header_text = xlsx_header_text(xlsx)
+                if contains_istrening(header_text):
+                    matched_source = "xlsx_header"
+                    included = True
+                # Try to parse a date from the header if start was missing
+                if not resolved_start:
+                    guess = parse_datetime_from_text(header_text)
+                    if guess:
+                        resolved_start = guess
+                        start_disp = resolved_start.isoformat()
+            except Exception as e:
+                header_text = f"(no xlsx header: {e})"
+
+        # 3) Enforce cut-off date (must be known and >= DATE_MIN_UTC)
+        date_ok = resolved_start is not None and (resolved_start >= DATE_MIN_UTC) and (resolved_start <= DATE_MAX_UTC)
+        included = included and date_ok
 
         dbg_rows.append({
             "Event ID": eid,
             "Event Title": title,
-            **dbg
+            "Start UTC": start_disp,
+            "Matched (fields/xlsx)": matched_source or "no",
+            "Cutoff Date OK": "Yes" if date_ok else "No",
+            "Included": "Yes" if included else "No",
         })
 
-        if not include:
+        if not included:
             continue
 
         # Attendance table (prefer XLSX)
+        table = pd.DataFrame(columns=["Member", "Raw Status", "Raw Reason"])
         try:
             xlsx = await sp.get_event_attendance_xlsx(eid)
             table = read_attendance_xlsx(xlsx)
         except Exception as e:
             log(f"WARNING: XLSX not available for {eid}: {e}")
-            table = pd.DataFrame(columns=["Member", "Raw Status", "Raw Reason"])
-            # Fallback: participants structure, if any
+            # fallback: participants
             participants = details.get("participants") or details.get("members") or []
             for p in participants:
                 table.loc[len(table)] = [
@@ -270,8 +298,8 @@ async def fetch_rows() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
 
         table["Status"] = table["Raw Status"].map(normalize_status)
         table.insert(0, "Event ID", eid)
-        table.insert(1, "Event Title", title)
-        table.insert(2, "Event Start (UTC)", start_utc.isoformat())
+        table.insert(1, "Event Title", title or "(no title)")
+        table.insert(2, "Event Start (UTC)", (resolved_start or start_utc or DATE_MIN_UTC).isoformat())
 
         if "Override Status" not in table.columns:
             table["Override Status"] = ""
@@ -281,14 +309,15 @@ async def fetch_rows() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         table = table[ATT_COLUMNS]
         att_rows.extend(table.to_dict(orient="records"))
 
-    # Close http session
+    # Close HTTP session
     if hasattr(sp, "clientsession") and sp.clientsession:
         await sp.clientsession.close()
 
     log(f"Prepared {len(att_rows)} attendance rows.")
     return att_rows, dbg_rows
 
-# ---------- Write to Sheets ----------
+# ---------------- Write to Sheets ----------------
+
 def upsert_attendance(ws, rows: List[Dict[str, Any]]):
     """Write full header always; preserve override columns by (Event ID + Member)."""
     existing = ws.get_all_records()
@@ -303,7 +332,7 @@ def upsert_attendance(ws, rows: List[Dict[str, Any]]):
                 new_df[col] = ""
         new_df = new_df[ATT_COLUMNS]
 
-        # Preserve overrides
+        # Preserve overrides by (Event ID, Member)
         key = ["Event ID", "Member"]
         for col in ["Override Status", "Override Reason"]:
             if col in existing_df.columns:
@@ -330,31 +359,19 @@ def upsert_attendance(ws, rows: List[Dict[str, Any]]):
     log("Attendance sheet updated.")
 
 def write_debug(ws_dbg, dbg_rows: List[Dict[str, Any]]):
+    cols = ["Event ID", "Event Title", "Start UTC", "Matched (fields/xlsx)", "Cutoff Date OK", "Included"]
     if not dbg_rows:
-        # Write header with a hint row
-        cols = [
-            "Event ID","Event Title","Start UTC","Start Local","Local Weekday (0=Mon)",
-            "Local Time","In Date Window","Weekday OK",f"Time {WINDOW_START.strftime('%H:%M')}-{WINDOW_END.strftime('%H:%M')} OK","Included"
-        ]
         ws_dbg.clear()
-        ws_dbg.update([cols, ["(no events found in API window)", "", "", "", "", "", "", "", "", ""]])
+        ws_dbg.update([cols, ["(no events in API window)", "", "", "", "", ""]])
         log("Debug sheet updated (no events).")
         return
-
-    # Build a stable column order
-    all_keys = [
-        "Event ID","Event Title","Start UTC","Start Local","Local Weekday (0=Mon)",
-        "Local Time","In Date Window","Weekday OK",f"Time {WINDOW_START.strftime('%H:%M')}-{WINDOW_END.strftime('%H:%M')} OK","Included"
-    ]
-    rows = []
-    for r in dbg_rows:
-        rows.append([r.get(k, "") for k in all_keys])
-
+    rows = [[r.get(c, "") for c in cols] for r in dbg_rows]
     ws_dbg.clear()
-    ws_dbg.update([all_keys] + rows)
+    ws_dbg.update([cols] + rows)
     log("Debug sheet updated.")
 
-# ---------- Entrypoint ----------
+# ---------------- Entrypoint ----------------
+
 async def main():
     gc = sheets_client()
     sh = open_spreadsheet(gc)
