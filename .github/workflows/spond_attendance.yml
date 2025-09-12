@@ -25,16 +25,8 @@ jobs:
       - name: Run sync
         env:
           PYTHONUNBUFFERED: "1"
-          # Event + group filters
-          EVENT_NAME_FILTER: "Istrening U18B"
-          GROUP_NAME_FILTER: "IHKS G2008b/G2009b"
-          # Title match mode: iexact (default), icontains, equals, contains
-          MATCH_MODE: "iexact"
-          # Only import events from this date (UTC) forward
-          MIN_START_UTC: "2025-07-01T00:00:00Z"
-          # If event title is missing from the API, look inside the XLSX export
-          FALLBACK_TITLE_FROM_XLSX: "true"
-
+          # Local timezone for weekday/time filtering (change if needed)
+          TIMEZONE: "Europe/Oslo"
           # Secrets
           SPOND_USERNAME: ${{ secrets.SPOND_USERNAME }}
           SPOND_PASSWORD: ${{ secrets.SPOND_PASSWORD }}
