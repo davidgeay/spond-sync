@@ -16,8 +16,12 @@ SHEET_ID = os.environ["SHEET_ID"]
 TAB_NAME = "Attendance"
 EVENT_NAME_FILTER = "Istrening U18B"
 
-PAST_DAYS = int(os.environ.get("PAST_DAYS", "120"))
-FUTURE_DAYS = int(os.environ.get("FUTURE_DAYS", "14"))
+# Hard cutoff: only events strictly after July 1, 2025 (UTC)
+EVENT_START_MIN = datetime(2025, 7, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+# Window for fetching from Spond API (can be wide; we'll still hard-filter by date)
+PAST_DAYS = int(os.environ.get("PAST_DAYS", "365"))
+FUTURE_DAYS = int(os.environ.get("FUTURE_DAYS", "365"))
 
 HEADER = [
     "EventID","EventName","EventStartIso","MemberID","MemberName",
@@ -62,6 +66,22 @@ def index_existing(ws):
 def is_truthy(x) -> bool:
     return str(x).strip().lower() in TRUTHY
 
+def _parse_event_start_iso(ev) -> tuple[str, datetime | None]:
+    # Prefer explicit UTC if present
+    raw = ev.get("startTimeUtc") or ev.get("startTime") or ""
+    if not raw:
+        return "", None
+    try:
+        # Accept e.g. "2025-09-12T18:00:00Z" or with offset
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        iso = dt.isoformat().replace("+00:00", "Z")
+        return iso, dt
+    except Exception:
+        return raw, None
+
 async def fetch_attendance_rows():
     client = spond.SpondClient()
     await client.login(os.environ["SPOND_USERNAME"], os.environ["SPOND_PASSWORD"])
@@ -78,8 +98,12 @@ async def fetch_attendance_rows():
         if title != EVENT_NAME_FILTER:
             continue
 
+        start_iso, start_dt = _parse_event_start_iso(ev)
+        # Hard date filter: only events strictly after 2025-07-01T00:00:00Z
+        if not start_dt or start_dt <= EVENT_START_MIN:
+            continue
+
         event_id = ev["id"]
-        start_iso = ev.get("startTimeUtc") or ev.get("startTime") or ""
 
         details = await client.get_event(event_id)
         participants = details.get("participants") or details.get("members") or []
@@ -113,12 +137,14 @@ def upsert(ws, new_rows):
         if key in idx:
             row_index, manual_override_val = idx[key]
             if is_truthy(manual_override_val):
-                continue  # don't touch manual overrides
-            # preserve existing ManualOverride
+                continue  # keep user's manual edits
             current_mo = ws.cell(row_index, HEADER.index("ManualOverride")+1).value or ""
             r_to_write = r.copy()
             r_to_write[-1] = current_mo
-            rng = f"A{row_index}:{chr(ord('A')+len(HEADER)-1)}{row_index}"
+            # Range like A{row}:L{row}
+            end_col_idx = len(HEADER)  # 12 -> L
+            end_col_letter = chr(ord('A') + end_col_idx - 1)
+            rng = f"A{row_index}:{end_col_letter}{row_index}"
             updates.append({"range": rng, "values": [r_to_write]})
         else:
             appends.append(r)
