@@ -1,5 +1,5 @@
 # attendance_sync.py
-# Required secrets: SPOND_USERNAME, SPOND_PASSWORD, GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID
+# Secrets needed: SPOND_USERNAME, SPOND_PASSWORD, GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID
 # pip deps: spond gspread google-auth pandas openpyxl python-dateutil
 
 import os, io, json, asyncio, re
@@ -13,25 +13,22 @@ import gspread
 from google.oauth2.service_account import Credentials
 from spond import spond
 
-# ---------------- Fixed settings ----------------
+# ---------------- Settings ----------------
 GROUP_NAME = "IHKS G2008b/G2009b"
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Oslo"))
-CUTOFF_LOCAL = datetime(2025, 8, 1, 0, 0, tzinfo=TIMEZONE)   # include events on/after this date
+CUTOFF_LOCAL = datetime(2025, 8, 1, 0, 0, tzinfo=TIMEZONE)     # include events on/after
 CUTOFF_UTC = CUTOFF_LOCAL.astimezone(timezone.utc)
 NOW_UTC = datetime.now(timezone.utc)
 
 SHEET_ATT = "Attendance"
 SHEET_DBG = "Debug"
-
-# wide sheet layout
 FIXED_COLS = ["Player", "Total Present", "Total Missed", "Total Unanswered"]
 
-# keyword match
 ISTR_PAT = re.compile(r"\bistrening\b", re.IGNORECASE)
 
 def log(msg: str): print(f"[spond-sync] {msg}", flush=True)
 
-# ---------------- Google Sheets helpers ----------------
+# ---------------- Google Sheets ----------------
 def sheets_client() -> gspread.Client:
     svc_json = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     creds = Credentials.from_service_account_info(
@@ -52,7 +49,7 @@ def get_or_create_ws(sh, title: str):
             return sh.worksheet(title)
         raise
 
-# ---------------- Utilities ----------------
+# ---------------- Utils ----------------
 def _pick(d: Dict[str, Any], *keys):
     for k in keys:
         if k in d and d[k] is not None:
@@ -96,16 +93,19 @@ def parse_datetime_from_text(text: str) -> Optional[datetime]:
     except Exception:
         return None
 
-# ---------------- XLSX parsing (all sheets, keep tutors/guardians) ----------------
-# We only exclude obvious leaders/coaches/admins. Tutors/guardians stay IN.
-ROLE_WORDS_EXCLUDE = {"leader", "leder", "coach", "trener", "admin"}
+# ---------------- XLSX parsing (robust) ----------------
+ROLE_WORDS_EXCLUDE = {"leader", "leder", "coach", "trener", "admin"}   # tutors/guardians stay
 
 NAME_CANDS   = ["Name", "Member name", "Member", "Participant", "Navn", "Deltaker", "Spiller", "Player"]
-STATUS_CANDS = ["Status", "Response", "Attending", "Svar", "Svarstatus", "Attendance",
-                "Kommer", "Deltar", "Deltar ikke", "Kommer ikke", "Påmeldt", "RSVP"]
+STATUS_CANDS = ["Status", "Response", "Svar", "Svarstatus", "Attendance", "Attending", "RSVP"]
 REASON_CANDS = ["Note", "Reason", "Absence reason", "Kommentar", "Begrunnelse", "Fraværsgrunn",
                 "Årsak", "Notes", "Message", "Kommentarer"]
 ROLE_CANDS   = ["Type", "Role", "Rolle", "Kategori", "Group", "Gruppe", "Category"]
+
+# headers that might be boolean one-hots for yes/no
+YES_HDR_HINTS = re.compile(r"(attend|kommer|deltar|påmeld|present|going|ja)", re.I)
+NO_HDR_HINTS  = re.compile(r"(declin|kommer\s*ikke|deltar\s*ikke|nei|absent|not\s*going|kan\s*ikke)", re.I)
+NORES_HDR_HINTS = re.compile(r"(no\s*resp|ubesvar|ingen\s*svar|not\s*respond)", re.I)
 
 def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols = [str(c).strip() for c in df.columns]
@@ -122,9 +122,48 @@ def _leaders_only_sheet_name(sheet_name: str) -> bool:
     s = sheet_name.lower()
     return any(x in s for x in ("leder", "leader", "coach", "trener", "admin"))
 
+def _truthy(v: Any) -> bool:
+    s = str(v).strip().lower()
+    return s in {"1", "true", "yes", "ja", "x", "✓", "check", "checked", "present"}
+
+def _falsy(v: Any) -> bool:
+    s = str(v).strip().lower()
+    return s in {"0", "false", "no", "nei", "x", "✗", "not present"}
+
+def infer_status_from_row(row: pd.Series, name_col: str, status_col: Optional[str]) -> Tuple[str, str]:
+    """Return (raw_status_text, raw_reason_text). If status_col empty, infer from the rest of the row."""
+    reason = ""
+    if status_col:
+        raw = str(row.get(status_col, "")).strip()
+        if raw:
+            return raw, reason
+
+    # Try boolean / one-hot columns
+    for col in row.index:
+        if col == name_col: 
+            continue
+        val = row[col]
+        if YES_HDR_HINTS.search(str(col)) and _truthy(val):
+            return "Present", ""
+        if NO_HDR_HINTS.search(str(col)) and _truthy(val):
+            return "Absent", str(val)
+        if NORES_HDR_HINTS.search(str(col)) and _truthy(val):
+            return "No response", ""
+
+    # Fallback: scan entire row text for keywords
+    blob = " ".join([str(v) for k, v in row.items() if k != name_col and pd.notna(v)]).lower()
+    if re.search(r"(accepted|attending|present|going|kommer|deltar|påmeldt|ja|møter)", blob):
+        return "Present", ""
+    if re.search(r"(declin|kommer\s*ikke|deltar\s*ikke|nei|fravær|kan\s*ikke)", blob):
+        return "Absent", ""
+    if re.search(r"(no\s*response|ubesvart|ingen\s*svar|not\s*respond)", blob):
+        return "No response", ""
+
+    # Nothing obvious
+    return "", ""
+
 def read_attendance_xlsx_all(xlsx_bytes: bytes) -> pd.DataFrame:
-    """Return table with Member, Raw Status, Raw Reason — from ALL sheets.
-       We FILTER OUT leader/coach/admin ROWS but KEEP everyone else (including tutors/guardians)."""
+    """Rows: Member, Raw Status, Raw Reason. Keeps tutors/guardians, drops only coaches/admins."""
     try:
         sheets = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=None)
     except Exception:
@@ -132,11 +171,9 @@ def read_attendance_xlsx_all(xlsx_bytes: bytes) -> pd.DataFrame:
 
     frames: List[pd.DataFrame] = []
     for sheet_name, df in sheets.items():
-        if df is None or df.empty:
+        if df is None or df.empty: 
             continue
-
-        # If the sheet is *clearly* a dedicated leaders/admins tab by name, skip it.
-        if _leaders_only_sheet_name(sheet_name):
+        if _leaders_only_sheet_name(sheet_name):  # a dedicated leaders tab
             continue
 
         df = df.copy()
@@ -147,72 +184,63 @@ def read_attendance_xlsx_all(xlsx_bytes: bytes) -> pd.DataFrame:
         reason_col = _pick_col(df, REASON_CANDS)
         role_col   = _pick_col(df, ROLE_CANDS)
 
-        # Row-level filtering: drop leaders/admins/coaches; KEEP tutors/guardians/parents.
+        # filter out coaches/admins only
         if role_col:
             mask_excl = df[role_col].astype(str).str.lower().str.contains(
                 r"\b(" + "|".join(ROLE_WORDS_EXCLUDE) + r")\b"
             )
             df = df[~mask_excl]
 
-        # Sometimes name contains "(Leder)" etc. Filter out just those rows.
+        # also remove names that explicitly contain (leder/coach/admin)
         if name_col:
             mask_name_leader = df[name_col].astype(str).str.lower().str.contains(r"\(.*(leder|coach|admin).*\)")
             df = df[~mask_name_leader]
 
+        if not name_col:
+            continue
         if df.empty:
             continue
 
-        slim = pd.DataFrame()
-        if name_col:   slim["Member"] = df[name_col].astype(str)
-        if status_col: slim["Raw Status"] = df[status_col].astype(str)
-        if reason_col: slim["Raw Reason"] = df[reason_col].astype(str)
-        for c in ["Member", "Raw Status", "Raw Reason"]:
-            if c not in slim.columns: slim[c] = ""
+        members, statuses, reasons = [], [], []
+        for _, r in df.iterrows():
+            name = str(r.get(name_col, "")).strip()
+            if not name:
+                continue
+            raw_status, raw_reason = infer_status_from_row(r, name_col, status_col)
+            if not raw_status and status_col:   # final fallback to the raw cell
+                raw_status = str(r.get(status_col, "")).strip()
+            if not raw_reason and reason_col:
+                raw_reason = str(r.get(reason_col, "")).strip()
 
-        # basic clean
-        slim["Member"] = slim["Member"].str.strip()
-        slim = slim[slim["Member"].str.len().between(1, 80)]
+            members.append(name)
+            statuses.append(raw_status)
+            reasons.append(raw_reason)
 
-        frames.append(slim[["Member", "Raw Status", "Raw Reason"]])
+        if members:
+            frames.append(pd.DataFrame({"Member": members, "Raw Status": statuses, "Raw Reason": reasons}))
 
     if not frames:
         return pd.DataFrame(columns=["Member", "Raw Status", "Raw Reason"])
-    out = pd.concat(frames, ignore_index=True).fillna("")
-    return out
+    return pd.concat(frames, ignore_index=True).fillna("")
 
 # ---------------- Status normalization & coloring ----------------
 def normalize_status(raw: str) -> str:
-    """Map assorted RSVP strings to Present / Absent / No response."""
     if raw is None: return "No response"
-    r = str(raw).strip()
-    r_l = r.lower()
+    r_norm = re.sub(r"[^a-zA-ZæøåÆØÅ\s]", " ", str(raw).strip().lower())
 
-    # strip emojis/checkmarks and punctuation to make matching robust
-    r_norm = re.sub(r"[^a-zA-ZæøåÆØÅ\s]", " ", r_l)
-
-    # PRESENT
     if any(w in r_norm for w in [
         "yes","accepted","attending","present","going","kommer","deltar","påmeldt","ja","møter"
-    ]):
-        return "Present"
+    ]): return "Present"
 
-    # ABSENT
     if any(w in r_norm for w in [
-        "no ","no\n","declin","absent","kommer ikke","deltar ikke","nei","fravær","kan ikke"
-    ]):
-        return "Absent"
+        "no ","declin","absent","kommer ikke","deltar ikke","nei","fravær","kan ikke","not going"
+    ]): return "Absent"
 
-    # NO RESPONSE
     if any(w in r_norm for w in [
         "no response","unknown","maybe","usikker","kanskje","ubesvart","ingen svar","not responded","har ikke svart"
-    ]):
-        return "No response"
+    ]): return "No response"
 
-    # empty / dashes
-    if r.strip() in {"", "-", "—", "nan"}:
-        return "No response"
-
-    # fallback: if looks like a comment but no clear status, treat as no response
+    if str(raw).strip() in {"", "-", "—", "nan"}: return "No response"
     return "No response"
 
 def status_to_cell(status: str, reason: str) -> Tuple[str, str]:
@@ -241,10 +269,10 @@ async def resolve_group_id(sp: spond.Spond) -> Optional[str]:
         log(f"ERROR: Group '{GROUP_NAME}' not found.")
     return gid
 
-def xlsx_all_text(xlsx_bytes: bytes) -> str:
+def xlsx_all_text(xbytes: bytes) -> str:
     try:
         import openpyxl
-        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+        wb = openpyxl.load_workbook(io.BytesIO(xbytes), data_only=True)
         parts = []
         for ws in wb.worksheets:
             for r in ws.iter_rows(min_row=1, max_row=min(ws.max_row or 0, 200), values_only=True):
@@ -255,11 +283,9 @@ def xlsx_all_text(xlsx_bytes: bytes) -> str:
     except Exception:
         return ""
 
-# ---------------- Core: build wide matrix ----------------
+# ---------------- Collect + build matrix ----------------
 async def collect_events_and_attendance() -> Tuple[List[str], Dict[str, Dict[str, Tuple[str, str]]], List[Dict[str, Any]]]:
-    username = os.environ["SPOND_USERNAME"]; password = os.environ["SPOND_PASSWORD"]
-    sp = spond.Spond(username=username, password=password)
-
+    sp = spond.Spond(username=os.environ["SPOND_USERNAME"], password=os.environ["SPOND_PASSWORD"])
     try:
         gid = await resolve_group_id(sp)
         if not gid:
@@ -296,12 +322,11 @@ async def collect_events_and_attendance() -> Tuple[List[str], Dict[str, Dict[str
                 matched_src = "details"
             else:
                 try:
-                    xbytes = await sp.get_event_attendance_xlsx(eid)
-                    text = xlsx_all_text(xbytes)
-                    if contains_istrening(text):
+                    xb = await sp.get_event_attendance_xlsx(eid)
+                    if contains_istrening(xlsx_all_text(xb)):
                         matched_src = "xlsx"
                     if not start_utc:
-                        guess = parse_datetime_from_text(text)
+                        guess = parse_datetime_from_text(xlsx_all_text(xb))
                         if guess: start_utc = guess
                 except Exception:
                     pass
@@ -332,7 +357,6 @@ async def collect_events_and_attendance() -> Tuple[List[str], Dict[str, Dict[str
         event_headers = [h for _, h, _ in included]
 
         per_member: Dict[str, Dict[str, Tuple[str, str]]] = {}
-
         for (eid, header, _) in included:
             table = pd.DataFrame()
             try:
@@ -341,19 +365,15 @@ async def collect_events_and_attendance() -> Tuple[List[str], Dict[str, Dict[str
             except Exception as e:
                 log(f"WARNING: XLSX not available for {eid}: {e}")
 
-            member_status: Dict[str, Tuple[str, str]] = {}
             if not table.empty:
                 for _, row in table.iterrows():
                     name   = str(row.get("Member", "")).strip()
                     raw_st = str(row.get("Raw Status", "")).strip()
                     raw_re = str(row.get("Raw Reason", "")).strip()
-                    if not name: continue
-                    txt, color = status_to_cell(raw_st, raw_re)
-                    member_status[name] = (txt, color)
-
-            # fold into per_member structure
-            for name, val in member_status.items():
-                per_member.setdefault(name, {})[header] = val
+                    if not name: 
+                        continue
+                    txt, code = status_to_cell(raw_st, raw_re)
+                    per_member.setdefault(name, {})[header] = (txt, code)
 
         return event_headers, per_member, debug_rows
 
@@ -364,9 +384,7 @@ async def collect_events_and_attendance() -> Tuple[List[str], Dict[str, Dict[str
         except Exception:
             pass
 
-# ---------------- Write wide sheet + colors ----------------
 def build_matrix(event_headers: List[str], per_member: Dict[str, Dict[str, Tuple[str, str]]]) -> Tuple[List[List[str]], List[List[str]]]:
-    # roster: every seen member; keep tutors/guardians; exclude only obvious admin/coach/leder in the NAME text
     def is_admin_like(name: str) -> bool:
         ln = name.lower()
         return any(w in ln for w in ("coach", "trener", "leder", "admin"))
@@ -379,19 +397,11 @@ def build_matrix(event_headers: List[str], per_member: Dict[str, Dict[str, Tuple
     for m in members:
         row_values = [m, "", "", ""]
         row_colors: List[str] = []
+        present = noresp = absent = 0
 
-        present = 0
-        noresp = 0
-        absent = 0
-
-        status_map = per_member.get(m, {})
         for eh in event_headers:
-            if eh in status_map:
-                text, code = status_map[eh]
-            else:
-                text, code = ("No response", "noresp")
-            row_values.append(text)
-            row_colors.append(code)
+            text, code = per_member.get(m, {}).get(eh, ("No response", "noresp"))
+            row_values.append(text); row_colors.append(code)
             if code == "present": present += 1
             elif code == "absent": absent += 1
             else: noresp += 1
@@ -401,8 +411,7 @@ def build_matrix(event_headers: List[str], per_member: Dict[str, Dict[str, Tuple
         row_values[2] = str(missed)
         row_values[3] = str(noresp)
 
-        values.append(row_values)
-        colors.append(row_colors)
+        values.append(row_values); colors.append(row_colors)
 
     return values, colors
 
@@ -430,11 +439,8 @@ def write_wide_sheet(sh, ws_att, event_headers: List[str], values: List[List[str
     }
 
     requests = []
-    n_rows = len(values)
-    n_events = len(event_headers)
+    n_rows, n_events = len(values), len(event_headers)
     if n_rows > 0 and n_events > 0:
-        start_row = 1
-        start_col = 4  # column E
         for r in range(n_rows):
             for c in range(n_events):
                 code = colors[r][c]
@@ -444,10 +450,10 @@ def write_wide_sheet(sh, ws_att, event_headers: List[str], values: List[List[str
                     "repeatCell": {
                         "range": {
                             "sheetId": ws_att.id,
-                            "startRowIndex": start_row + r,
-                            "endRowIndex":   start_row + r + 1,
-                            "startColumnIndex": start_col + c,
-                            "endColumnIndex":   start_col + c + 1,
+                            "startRowIndex": 1 + r,
+                            "endRowIndex":   2 + r,
+                            "startColumnIndex": 4 + c,
+                            "endColumnIndex":   5 + c,
                         },
                         "cell": {"userEnteredFormat": {"backgroundColor": rgb}},
                         "fields": "userEnteredFormat.backgroundColor"
