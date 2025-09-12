@@ -25,9 +25,7 @@ jobs:
       - name: Run sync
         env:
           PYTHONUNBUFFERED: "1"
-          # Local timezone for weekday/time filtering (change if needed)
-          TIMEZONE: "Europe/Oslo"
-          # Secrets
+          TIMEZONE: "Europe/Oslo"                 # adjust if needed
           SPOND_USERNAME: ${{ secrets.SPOND_USERNAME }}
           SPOND_PASSWORD: ${{ secrets.SPOND_PASSWORD }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
