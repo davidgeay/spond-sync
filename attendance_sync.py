@@ -1,17 +1,17 @@
 # attendance_sync.py
-# Requirements (installed by workflow): spond gspread google-auth pandas openpyxl python-dateutil
+# Requirements (installed in the workflow): spond gspread google-auth pandas openpyxl python-dateutil
 #
-# GitHub Secrets needed:
+# Secrets in GitHub (Settings → Secrets and variables → Actions):
 #   SPOND_USERNAME, SPOND_PASSWORD, GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID
 #
 # Behavior:
 #   - Only group named "IHKS G2008b/G2009b"
 #   - Date window: from 2025-08-01 (inclusive) up to time of sync (UTC now)
 #   - Include an event if the word "istrening" appears ANYWHERE (case-insensitive)
-#       * title, description/notes/message/text/location/category
+#       * title, description/notes/message/text/location/category (even if nested dict/list)
 #       * OR in the attendance XLSX header text (fallback)
-#   - No weekday or time-of-day filtering
-#   - Sheet tabs: "Attendance" (data) and "Debug" (diagnostics)
+#   - No weekday/time-of-day filtering
+#   - Sheets: "Attendance" (data) and "Debug" (diagnostics)
 
 import os, io, json, asyncio, re
 from datetime import datetime, timezone
@@ -66,7 +66,7 @@ def get_or_create_ws(sh, title: str):
             return sh.worksheet(title)
         raise
 
-# ---------------- Spond helpers ----------------
+# ---------------- Utilities ----------------
 
 def _pick(d: Dict[str, Any], *keys):
     for k in keys:
@@ -90,9 +90,32 @@ def parse_start_utc(d: Dict[str, Any]) -> Optional[datetime]:
     except Exception:
         return None
 
-def contains_istrening(*texts: Optional[str]) -> bool:
-    for t in texts:
-        if t and ISTR_PAT.search(t):
+def to_flat_text(value: Any) -> str:
+    """Flatten any dict/list/bytes/etc to a single searchable string."""
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+    if isinstance(value, dict):
+        parts = []
+        for k, v in value.items():
+            parts.append(to_flat_text(k))
+            parts.append(to_flat_text(v))
+        return " | ".join([p for p in parts if p])
+    if isinstance(value, (list, tuple, set)):
+        return " | ".join([to_flat_text(v) for v in value if v is not None])
+    # Fallback
+    return str(value)
+
+def contains_istrening(*values: Any) -> bool:
+    for v in values:
+        text = to_flat_text(v)
+        if text and ISTR_PAT.search(text):
             return True
     return False
 
@@ -101,7 +124,7 @@ def parse_datetime_from_text(text: str) -> Optional[datetime]:
     try:
         dt = dtparser.parse(text, fuzzy=True, dayfirst=True)
         if dt.tzinfo is None:
-            dt = TIMEZONE.localize(dt) if hasattr(TIMEZONE, "localize") else dt.replace(tzinfo=TIMEZONE)
+            dt = dt.replace(tzinfo=TIMEZONE)
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
@@ -191,130 +214,134 @@ async def fetch_rows() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     password = os.environ["SPOND_PASSWORD"]
     sp = spond.Spond(username=username, password=password)
 
-    gid = await resolve_group_id(sp)
-    if not gid:
-        await sp.clientsession.close()
-        return [], []
-
-    log(f"Fetching events (UTC {DATE_MIN_UTC.isoformat()} → {DATE_MAX_UTC.isoformat()}) ...")
     try:
-        events = await sp.get_events(
-            group_id=gid,
-            min_start=DATE_MIN_UTC,
-            max_start=DATE_MAX_UTC,
-            include_scheduled=True,
-            max_events=500
-        )
-    except TypeError:
-        events = await sp.get_events(min_start=DATE_MIN_UTC, max_start=DATE_MAX_UTC)
+        gid = await resolve_group_id(sp)
+        if not gid:
+            return [], []
 
-    log(f"Fetched {len(events)} events (list may be minimal).")
-
-    att_rows: List[Dict[str, Any]] = []
-    dbg_rows: List[Dict[str, Any]] = []
-
-    for ev in events:
-        eid = _pick(ev, "id", "eventId", "uid")
-        if not eid:
-            continue
-
-        # Always fetch details
+        log(f"Fetching events (UTC {DATE_MIN_UTC.isoformat()} → {DATE_MAX_UTC.isoformat()}) ...")
         try:
-            details = await sp.get_event(eid)
-        except Exception as e:
-            log(f"WARNING: get_event failed for {eid}: {e}")
-            continue
+            events = await sp.get_events(
+                group_id=gid,
+                min_start=DATE_MIN_UTC,
+                max_start=DATE_MAX_UTC,
+                include_scheduled=True,
+                max_events=500
+            )
+        except TypeError:
+            events = await sp.get_events(min_start=DATE_MIN_UTC, max_start=DATE_MAX_UTC)
 
-        title = _pick(details, "title", "name", "eventName", "subject") or ""
-        desc  = _pick(details, "description", "notes", "message", "text") or ""
-        where = _pick(details, "location", "place", "venue", "address") or ""
-        categ = _pick(details, "category", "type") or ""
+        log(f"Fetched {len(events)} events (list may be minimal).")
 
-        start_utc = parse_start_utc(details)  # we still need this for the cut-off
-        start_disp = start_utc.isoformat() if start_utc else "NO-START"
-        log(f"  • {eid} | {title or 'NO-TITLE'} | {start_disp}")
+        att_rows: List[Dict[str, Any]] = []
+        dbg_rows: List[Dict[str, Any]] = []
 
-        matched_source = ""
-        included = False
-        resolved_start = start_utc
+        for ev in events:
+            eid = _pick(ev, "id", "eventId", "uid")
+            if not eid:
+                continue
 
-        # 1) Direct fields contains 'istrening'?
-        if contains_istrening(title, desc, where, categ):
-            matched_source = "fields"
-            included = True
+            # Full details for reliable fields
+            try:
+                details = await sp.get_event(eid)
+            except Exception as e:
+                log(f"WARNING: get_event failed for {eid}: {e}")
+                continue
 
-        # 2) If not matched yet, look at XLSX header text
-        header_text = ""
-        if not included:
+            title = _pick(details, "title", "name", "eventName", "subject")
+            desc  = _pick(details, "description", "notes", "message", "text")
+            where = _pick(details, "location", "place", "venue", "address")
+            categ = _pick(details, "category", "type")
+
+            start_utc = parse_start_utc(details)  # used for cut-off
+            start_disp = start_utc.isoformat() if start_utc else "NO-START"
+            log(f"  • {eid} | {(title if isinstance(title,str) else 'NO-TITLE') or 'NO-TITLE'} | {start_disp}")
+
+            matched_source = ""
+            included = False
+            resolved_start = start_utc
+
+            # 1) Search across flattened fields
+            if contains_istrening(title, desc, where, categ):
+                matched_source = "fields"
+                included = True
+
+            # 2) If not matched yet, inspect XLSX header
+            header_text = ""
+            if not included:
+                try:
+                    xlsx = await sp.get_event_attendance_xlsx(eid)
+                    header_text = xlsx_header_text(xlsx)
+                    if contains_istrening(header_text):
+                        matched_source = "xlsx_header"
+                        included = True
+                    # Try to infer a date if missing
+                    if not resolved_start:
+                        guess = parse_datetime_from_text(header_text)
+                        if guess:
+                            resolved_start = guess
+                            start_disp = resolved_start.isoformat()
+                except Exception as e:
+                    header_text = f"(no xlsx header: {e})"
+
+            # 3) Enforce cut-off window (must know start and be within range)
+            date_ok = resolved_start is not None and (DATE_MIN_UTC <= resolved_start <= DATE_MAX_UTC)
+            included = included and date_ok
+
+            dbg_rows.append({
+                "Event ID": eid,
+                "Event Title": to_flat_text(title)[:200],
+                "Start UTC": start_disp,
+                "Matched (fields/xlsx)": matched_source or "no",
+                "Cutoff Date OK": "Yes" if date_ok else "No",
+                "Included": "Yes" if included else "No",
+            })
+
+            if not included:
+                continue
+
+            # Attendance table (prefer XLSX)
+            table = pd.DataFrame(columns=["Member", "Raw Status", "Raw Reason"])
             try:
                 xlsx = await sp.get_event_attendance_xlsx(eid)
-                header_text = xlsx_header_text(xlsx)
-                if contains_istrening(header_text):
-                    matched_source = "xlsx_header"
-                    included = True
-                # Try to parse a date from the header if start was missing
-                if not resolved_start:
-                    guess = parse_datetime_from_text(header_text)
-                    if guess:
-                        resolved_start = guess
-                        start_disp = resolved_start.isoformat()
+                table = read_attendance_xlsx(xlsx)
             except Exception as e:
-                header_text = f"(no xlsx header: {e})"
+                log(f"WARNING: XLSX not available for {eid}: {e}")
+                # fallback: participants
+                participants = details.get("participants") or details.get("members") or []
+                for p in participants:
+                    table.loc[len(table)] = [
+                        to_flat_text(p.get("name")) or f"ID:{p.get('memberId') or p.get('id') or ''}",
+                        str(p.get("status") or p.get("attendance") or ""),
+                        to_flat_text(p.get("absenceReason") or p.get("comment") or "")
+                    ]
 
-        # 3) Enforce cut-off date (must be known and >= DATE_MIN_UTC)
-        date_ok = resolved_start is not None and (resolved_start >= DATE_MIN_UTC) and (resolved_start <= DATE_MAX_UTC)
-        included = included and date_ok
+            if table.empty:
+                continue
 
-        dbg_rows.append({
-            "Event ID": eid,
-            "Event Title": title,
-            "Start UTC": start_disp,
-            "Matched (fields/xlsx)": matched_source or "no",
-            "Cutoff Date OK": "Yes" if date_ok else "No",
-            "Included": "Yes" if included else "No",
-        })
+            table["Status"] = table["Raw Status"].map(normalize_status)
+            table.insert(0, "Event ID", eid)
+            table.insert(1, "Event Title", to_flat_text(title) or "(no title)")
+            table.insert(2, "Event Start (UTC)", (resolved_start or start_utc or DATE_MIN_UTC).isoformat())
 
-        if not included:
-            continue
+            if "Override Status" not in table.columns:
+                table["Override Status"] = ""
+            if "Override Reason" not in table.columns:
+                table["Override Reason"] = ""
 
-        # Attendance table (prefer XLSX)
-        table = pd.DataFrame(columns=["Member", "Raw Status", "Raw Reason"])
+            table = table[ATT_COLUMNS]
+            att_rows.extend(table.to_dict(orient="records"))
+
+        log(f"Prepared {len(att_rows)} attendance rows.")
+        return att_rows, dbg_rows
+
+    finally:
+        # Always close the session to avoid "Unclosed client session" warnings
         try:
-            xlsx = await sp.get_event_attendance_xlsx(eid)
-            table = read_attendance_xlsx(xlsx)
-        except Exception as e:
-            log(f"WARNING: XLSX not available for {eid}: {e}")
-            # fallback: participants
-            participants = details.get("participants") or details.get("members") or []
-            for p in participants:
-                table.loc[len(table)] = [
-                    p.get("name") or f"ID:{p.get('memberId') or p.get('id') or ''}",
-                    str(p.get("status") or p.get("attendance") or ""),
-                    str(p.get("absenceReason") or p.get("comment") or "")
-                ]
-
-        if table.empty:
-            continue
-
-        table["Status"] = table["Raw Status"].map(normalize_status)
-        table.insert(0, "Event ID", eid)
-        table.insert(1, "Event Title", title or "(no title)")
-        table.insert(2, "Event Start (UTC)", (resolved_start or start_utc or DATE_MIN_UTC).isoformat())
-
-        if "Override Status" not in table.columns:
-            table["Override Status"] = ""
-        if "Override Reason" not in table.columns:
-            table["Override Reason"] = ""
-
-        table = table[ATT_COLUMNS]
-        att_rows.extend(table.to_dict(orient="records"))
-
-    # Close HTTP session
-    if hasattr(sp, "clientsession") and sp.clientsession:
-        await sp.clientsession.close()
-
-    log(f"Prepared {len(att_rows)} attendance rows.")
-    return att_rows, dbg_rows
+            if sp and getattr(sp, "clientsession", None):
+                await sp.clientsession.close()
+        except Exception:
+            pass
 
 # ---------------- Write to Sheets ----------------
 
