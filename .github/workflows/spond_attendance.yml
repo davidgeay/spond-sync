@@ -2,7 +2,7 @@ name: Spond Attendance Sync
 
 on:
   schedule:
-    - cron: "0 * * * *"   # every hour
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -11,22 +11,19 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install spond gspread google-auth pandas openpyxl
-
       - name: Run sync
         env:
           PYTHONUNBUFFERED: "1"
-          MATCH_MODE: "iexact"          # event-title matching (case/space tolerant)
-          GROUP_MATCH_MODE: "iexact"    # group-name matching (case/space tolerant)
+          MATCH_MODE: "iexact"          # event title: tolerant
+          GROUP_MATCH_MODE: "iexact"    # group name: tolerant
           EVENT_NAME_FILTER: "Istrening U18B"
           GROUP_NAME_FILTER: "IHKS G2008b/G2009b"
           SPOND_USERNAME: ${{ secrets.SPOND_USERNAME }}
