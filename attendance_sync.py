@@ -1,5 +1,8 @@
 # attendance_sync.py
+# Sync Spond attendance -> Google Sheets (one row per member per event)
+#
 # pip install: spond gspread google-auth pandas openpyxl
+# Secrets required: SPOND_USERNAME, SPOND_PASSWORD, GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID
 
 import os, json, asyncio, io, traceback
 from datetime import datetime, timezone, timedelta
@@ -8,11 +11,17 @@ import gspread
 from google.oauth2.service_account import Credentials
 from spond import spond
 
+# ---------- SETTINGS ----------
 SHEET_ID = os.environ["SHEET_ID"]
 TAB_NAME = "Attendance"
 EVENT_NAME_FILTER = "Istrening U18B"
-# Only take events strictly AFTER 2025-07-01
+
+# Include events ON/AFTER this timestamp (inclusive)
 EVENT_START_MIN = datetime(2025, 7, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+# Title matching mode: exact | iexact | contains | startswith
+MATCH_MODE = os.environ.get("MATCH_MODE", "iexact")
+# ------------------------------
 
 HEADER = [
     "EventID","EventName","EventStartIso","MemberID","MemberName",
@@ -21,23 +30,54 @@ HEADER = [
 ]
 TRUTHY = {"true","yes","1","y","ja","t"}
 
-def log(msg): print(f"[spond-sync] {msg}", flush=True)
+def log(msg: str): print(f"[spond-sync] {msg}", flush=True)
+
+def _norm(s: str) -> str:
+    return " ".join((s or "").split()).strip().lower()
+
+def title_matches(title: str, pattern: str) -> bool:
+    if MATCH_MODE == "exact":
+        return (title or "") == (pattern or "")
+    if MATCH_MODE == "iexact":
+        return _norm(title) == _norm(pattern)
+    if MATCH_MODE == "contains":
+        return _norm(pattern) in _norm(title)
+    if MATCH_MODE == "startswith":
+        return _norm(title).startswith(_norm(pattern))
+    return _norm(title) == _norm(pattern)
 
 def sheets_client_from_env():
     info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     creds = Credentials.from_service_account_info(
         info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive"],
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
     return gspread.authorize(creds)
 
 def get_ws(gc):
     sh = gc.open_by_key(SHEET_ID)
+    # 1) Try exact
     try:
         return sh.worksheet(TAB_NAME)
     except gspread.WorksheetNotFound:
+        pass
+    # 2) Tolerant search
+    wanted = TAB_NAME.strip().lower()
+    for ws in sh.worksheets():
+        if ws.title == TAB_NAME or ws.title.strip().lower() == wanted:
+            return ws
+    # 3) Create if truly missing; if API says exists, return the matched one
+    try:
         return sh.add_worksheet(title=TAB_NAME, rows=2000, cols=20)
+    except gspread.exceptions.APIError as e:
+        if "already exists" in str(e).lower():
+            for ws in sh.worksheets():
+                if ws.title.strip().lower() == wanted:
+                    return ws
+        raise
 
 def ensure_header(ws):
     existing = ws.row_values(1)
@@ -60,12 +100,14 @@ def is_truthy(x) -> bool:
 
 def parse_event_start_iso(ev):
     raw = ev.get("startTimeUtc") or ev.get("startTime") or ""
-    if not raw: return "", None
+    if not raw:
+        return "", None
     try:
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         dt = dt.astimezone(timezone.utc)
-        return dt.isoformat().replace("+00:00","Z"), dt
+        return dt.isoformat().replace("+00:00", "Z"), dt
     except Exception:
         return raw, None
 
@@ -74,21 +116,29 @@ async def fetch_attendance_rows():
     password = os.environ["SPOND_PASSWORD"]
     s = spond.Spond(username=username, password=password)
 
-    # ✅ FIX: pass datetimes, not strings
-    min_start = EVENT_START_MIN            # inclusive on API side; we still hard-filter below
+    # Ask wide; still hard-filter locally. Datetimes required by lib:
+    min_start = EVENT_START_MIN  # inclusive on API side too
     max_start = datetime.now(timezone.utc) + timedelta(days=365)
 
     log(f"Fetching events (min_start={min_start.isoformat()}, max_start={max_start.isoformat()}) ...")
     events = await s.get_events(min_start=min_start, max_start=max_start)
+    log(f"Fetched {len(events or [])} events total.")
+    for ev in (events or [])[:25]:
+        raw_start = ev.get("startTimeUtc") or ev.get("startTime") or ""
+        log(f"  - {ev.get('id')} | {ev.get('title')} | {raw_start}")
+    matches = [ev for ev in (events or []) if title_matches(ev.get('title',''), EVENT_NAME_FILTER)]
+    log(f"Title matches for '{EVENT_NAME_FILTER}' ({MATCH_MODE}): {len(matches)}")
 
     rows = []
-    for ev in events or []:
+    for ev in matches:
         title = (ev.get("title") or "").strip()
-        if title != EVENT_NAME_FILTER:
-            continue
         start_iso, start_dt = parse_event_start_iso(ev)
-        # Hard filter: strictly after 2025-07-01
-        if not start_dt or start_dt <= EVENT_START_MIN:
+        # Inclusive cutoff: keep events with start >= EVENT_START_MIN
+        if not start_dt:
+            log(f"Skip {ev.get('id')}: no start time parsed.")
+            continue
+        if start_dt < EVENT_START_MIN:
+            log(f"Skip {ev.get('id')}: {start_dt.isoformat()} < cutoff {EVENT_START_MIN.isoformat()}")
             continue
 
         event_id = ev["id"]
@@ -142,7 +192,7 @@ async def fetch_attendance_rows():
                 "spond-sync", datetime.utcnow().isoformat(timespec="seconds")+"Z", ""
             ])
 
-    # ✅ Ensure HTTP session is closed even if something errors
+    # Close HTTP session
     if hasattr(s, "close"):
         await s.close()
     elif hasattr(s, "clientsession") and s.clientsession:
