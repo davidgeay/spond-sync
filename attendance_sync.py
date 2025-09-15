@@ -1,5 +1,6 @@
 # attendance_sync.py
 # Secrets: SPOND_USERNAME, SPOND_PASSWORD, GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID
+# Optional: TIMEZONE, PLAYER_ALLOWLIST
 # Deps:    spond gspread google-auth pandas openpyxl python-dateutil
 
 import os, io, json, asyncio, re
@@ -98,24 +99,42 @@ def parse_datetime_from_text(text: str) -> Optional[datetime]:
         return None
 
 # ---------------- Attendance parsing ----------------
-# Role filtering: include only PLAYERS, exclude admins/coaches/tutors/guardians/parents etc.
+# Roles: keep only "players"; exclude admins/coaches/tutors/guardians/parents, including Norwegian terms.
 ROLE_INCLUDE_WORDS = {
     "player","spiller","deltaker","member","utøver","athlete","keeper","målvakt"
 }
 ROLE_EXCLUDE_WORDS = {
     "leader","leder","coach","trener","admin","administrator",
-    "lagleder","oppmann","team leader","staff",
-    "tutor","guardian","parent","foresatt","forelder"
+    "lagleder","oppmann","team leader","teamleder","staff",
+    "tutor","guardian","parent","foresatt","forelder","support"
 }
 
-# Column candidates (EN + NO)
+# Optional strict allowlist from env
+def load_allowlist() -> Optional[List[str]]:
+    raw = os.getenv("PLAYER_ALLOWLIST", "").strip()
+    if not raw:
+        return None
+    try:
+        arr = json.loads(raw)
+        if isinstance(arr, list):
+            return [normalize_name(str(x)) for x in arr]
+    except Exception:
+        pass
+    # fall back to comma-separated
+    return [normalize_name(x) for x in re.split(r",|\n", raw) if x.strip()]
+
 NAME_CANDS   = ["Name","Navn","Member name","Member","Participant","Deltaker","Spiller","Player"]
-STATUS_CANDS = ["Status","Response","Svar","Svarstatus","Attendance","Attending","RSVP"]
+STATUS_CANDS = ["Response","Svar","Status","Attendance","Attending","RSVP","Svarstatus"]
 REASON_CANDS = ["Note","Reason","Absence reason","Kommentar","Begrunnelse","Fraværsgrunn","Årsak","Notes","Message"]
 ROLE_CANDS   = ["Type","Role","Rolle","Kategori","Category","Group","Gruppe"]
+CHECKIN_CANDS= ["Checked in","Innsjekket","Oppmøte","Møtt"]
 
-YES_HDR_HINTS    = re.compile(r"(attend|kommer|deltar|påmeld|present|going|ja|møter)", re.I)
-NO_HDR_HINTS     = re.compile(r"(declin|kommer\s*ikke|deltar\s*ikke|nei|absent|not\s*going|kan\s*ikke)", re.I)
+YES_TOKENS = ("accepted","attending","present","going","kommer","deltar","påmeldt","ja","møter","check","checked in","checked_in","✓")
+NO_TOKENS  = ("declined","absent","kommer ikke","deltar ikke","nei","fravær","kan ikke","not going","rejected","✗")
+NR_TOKENS  = ("no response","unknown","maybe","usikker","kanskje","ubesvart","ingen svar","pending","not responded","har ikke svart","")
+
+YES_HDR_HINTS    = re.compile(r"(attend|kommer|deltar|påmeld|present|going|ja|møter|check)", re.I)
+NO_HDR_HINTS     = re.compile(r"(declin|kommer\s*ikke|deltar\s*ikke|nei|absent|not\s*going|kan\s*ikke|fravær)", re.I)
 NORES_HDR_HINTS  = re.compile(r"(no\s*resp|ubesvar|ingen\s*svar|not\s*respond)", re.I)
 
 def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -133,31 +152,41 @@ def _truthy(v: Any) -> bool:
     s = str(v).strip().lower()
     return s in {"1","true","yes","ja","x","✓","present","checked","check","kommer","deltar","påmeldt","going"}
 
-def infer_status_from_row(row: pd.Series, name_col: str, status_col: Optional[str]) -> Tuple[str, str]:
-    reason = ""
+def normalize_status(raw: Any) -> str:
+    s = str(raw or "").strip().lower()
+    if any(t in s for t in YES_TOKENS): return "Present"
+    if any(t in s for t in NO_TOKENS):  return "Absent"
+    if s == "": return "No response"
+    if any(t in s for t in NR_TOKENS):  return "No response"
+    return "No response"
+
+def infer_status_from_row(row: pd.Series, name_col: str,
+                          status_col: Optional[str],
+                          checkin_col: Optional[str]) -> Tuple[str, str]:
+    # 1) explicit status cell
     if status_col:
-        raw = str(row.get(status_col, "")).strip()
-        if raw:
-            return raw, reason
-    # boolean columns?
+        st = str(row.get(status_col, "")).strip()
+        if st:
+            return normalize_status(st), ""
+    # 2) explicit check-in wins as present
+    if checkin_col and _truthy(row.get(checkin_col, "")):
+        return "Present",""
+    # 3) boolean header inference
     for col in row.index:
         if col == name_col: continue
         val = row[col]
         if YES_HDR_HINTS.search(str(col)) and _truthy(val):
             return "Present", ""
         if NO_HDR_HINTS.search(str(col)) and _truthy(val):
-            return "Absent", str(val)
+            return "Absent", ""
         if NORES_HDR_HINTS.search(str(col)) and _truthy(val):
             return "No response", ""
-    # scan whole row text
+    # 4) scan text
     blob = " ".join([str(v) for k, v in row.items() if k != name_col and pd.notna(v)]).lower()
-    if re.search(r"(accepted|attending|present|going|kommer|deltar|påmeldt|ja|møter)", blob):
-        return "Present",""
-    if re.search(r"(declin|kommer\s*ikke|deltar\s*ikke|nei|fravær|kan\s*ikke|not\s*going)", blob):
-        return "Absent",""
-    if re.search(r"(no\s*response|ubesvart|ingen\s*svar|not\s*respond)", blob):
-        return "No response",""
-    return "",""
+    if any(t in blob for t in YES_TOKENS): return "Present",""
+    if any(t in blob for t in NO_TOKENS):  return "Absent",""
+    if any(t in blob for t in NR_TOKENS):  return "No response",""
+    return "No response",""
 
 def xlsx_all_text(xbytes: bytes) -> str:
     try:
@@ -167,8 +196,10 @@ def xlsx_all_text(xbytes: bytes) -> str:
         for ws in wb.worksheets:
             for r in ws.iter_rows(min_row=1, max_row=min(ws.max_row or 0, 200), values_only=True):
                 for c in r:
-                    if isinstance(c, str) and c.strip():
-                        parts.append(c.strip())
+                    if c is None: continue
+                    cs = str(c).strip()
+                    if cs:
+                        parts.append(cs)
         return "\n".join(parts)
     except Exception:
         return ""
@@ -193,10 +224,11 @@ def read_attendance_xlsx(xbytes: bytes) -> Tuple[pd.DataFrame, Dict[str,str]]:
         df = df.copy()
         df.columns = [str(c).strip() for c in df.columns]
 
-        name_col   = _pick_col(df, NAME_CANDS)
-        status_col = _pick_col(df, STATUS_CANDS)
-        reason_col = _pick_col(df, REASON_CANDS)
-        role_col   = _pick_col(df, ROLE_CANDS)
+        name_col    = _pick_col(df, NAME_CANDS)
+        status_col  = _pick_col(df, STATUS_CANDS)
+        reason_col  = _pick_col(df, REASON_CANDS)
+        checkin_col = _pick_col(df, CHECKIN_CANDS)
+        role_col    = _pick_col(df, ROLE_CANDS)
 
         if not name_col:
             continue
@@ -212,15 +244,12 @@ def read_attendance_xlsx(xbytes: bytes) -> Tuple[pd.DataFrame, Dict[str,str]]:
             if role_text:
                 roles.setdefault(normalize_name(name), role_text)
 
-            raw_status, raw_reason = infer_status_from_row(r, name_col, status_col)
-            if not raw_status and status_col:
-                raw_status = str(r.get(status_col, "")).strip()
-            if not raw_reason and reason_col:
-                raw_reason = str(r.get(reason_col, "")).strip()
+            st, _ = infer_status_from_row(r, name_col, status_col, checkin_col)
+            rsn = str(r.get(reason_col, "")).strip() if reason_col else ""
 
             members.append(name)
-            statuses.append(raw_status)
-            reasons.append(raw_reason)
+            statuses.append(st)
+            reasons.append(rsn)
 
         if members:
             frames.append(pd.DataFrame({"Member": members, "Raw Status": statuses, "Raw Reason": reasons}))
@@ -230,25 +259,10 @@ def read_attendance_xlsx(xbytes: bytes) -> Tuple[pd.DataFrame, Dict[str,str]]:
 
     return pd.concat(frames, ignore_index=True).fillna(""), roles
 
-# ---------------- JSON attendee extraction ----------------
-def normalize_status(raw: Any) -> str:
-    if raw is None: return "No response"
-    s = str(raw).strip().lower()
-
-    tokens_yes = ("yes","accepted","attending","present","going","kommer","deltar","påmeldt","ja","møter","checked_in","checkedin","checked-in")
-    tokens_no  = ("no ","declin","absent","kommer ikke","deltar ikke","nei","fravær","kan ikke","not going","rejected")
-    tokens_nr  = ("no response","unknown","maybe","usikker","kanskje","ubesvart","ingen svar","pending","not responded","har ikke svart")
-
-    if any(t in s for t in tokens_yes): return "Present"
-    if any(t in s for t in tokens_no):  return "Absent"
-    if any(t in s for t in tokens_nr):  return "No response"
-    if s in {"","-","—","nan"}: return "No response"
-    return "No response"
-
 def extract_from_json(d: Dict[str,Any]) -> Tuple[Dict[str,Tuple[str,str,str]], Dict[str,str]]:
     """
     Returns:
-      statuses_by_name: norm_name -> (display_name, status, role_text)
+      statuses_by_name: norm_name -> (display_name, normalized_status, role_text)
       roles_by_name:    norm_name -> role_text
     """
     by_name: Dict[str, Tuple[str,str,str]] = {}
@@ -270,10 +284,9 @@ def extract_from_json(d: Dict[str,Any]) -> Tuple[Dict[str,Tuple[str,str,str]], D
             role = str(_pick(p, "role","type","kategori","category","memberType") or "").strip().lower()
             if role: roles.setdefault(nkey, role)
 
-            st = _pick(p, "status","response","rsvpStatus","attendanceStatus")
+            st = _pick(p, "status","response","rsvpStatus","attendanceStatus","answer")
             if st is None:
-                # booleans?
-                if str(p.get("isAttending", "")).lower() in {"true","1"}: st = "attending"
+                if str(p.get("isAttending", "")).lower() in {"true","1"}: st = "accepted"
                 elif str(p.get("declined","")).lower() in {"true","1"}:   st = "declined"
                 else: st = ""
             norm = normalize_status(st)
@@ -281,7 +294,6 @@ def extract_from_json(d: Dict[str,Any]) -> Tuple[Dict[str,Tuple[str,str,str]], D
 
     return by_name, roles
 
-# ---------------- Status to cell ----------------
 def status_to_cell(status: str, reason: str) -> Tuple[str, str]:
     st = normalize_status(status)
     if st == "Present":
@@ -384,7 +396,7 @@ async def collect_events_and_attendance() -> Tuple[List[str], Dict[str, Dict[str
         event_headers = [h for _, h, _ in included]
 
         per_member: Dict[str, Dict[str, Tuple[str, str]]] = {}
-        global_role_flags: Dict[str, bool] = {}  # norm_name -> True if looks like player
+        role_flags: Dict[str, bool] = {}  # norm_name -> True if looks like player
 
         for (eid, header, _) in included:
             # JSON attendees
@@ -405,27 +417,26 @@ async def collect_events_and_attendance() -> Tuple[List[str], Dict[str, Dict[str
             except Exception:
                 pass
 
-            # Merge role info for relevance filter (players only)
+            # Merge role info
             role_by_name: Dict[str,str] = {}
             role_by_name.update(json_roles)
             role_by_name.update(x_roles)
 
-            def is_player_role(role_text: str) -> bool:
+            def is_player_role(role_text: str, display_name: str) -> bool:
                 t = (role_text or "").lower()
                 if any(w in t for w in ROLE_EXCLUDE_WORDS): return False
                 if any(w in t for w in ROLE_INCLUDE_WORDS): return True
-                # if unknown, leave undecided (we’ll infer from name; default include later)
-                return True
+                nm = (display_name or "").lower()
+                if any(w in nm for w in ROLE_EXCLUDE_WORDS): return False
+                return True  # default include
 
-            # Build statuses for this event
-            # 1) Use JSON if present, else XLSX, else No response
             used_names: set = set()
 
-            for nkey, (disp_name, st, role_text) in json_map.items():
-                txt, code = status_to_cell(st, "")
+            for nkey, (disp_name, norm_stat, role_text) in json_map.items():
+                txt, code = status_to_cell(norm_stat, "")
                 per_member.setdefault(disp_name, {})[header] = (txt, code)
-                used_names.add(normalize_name(disp_name))
-                global_role_flags.setdefault(nkey, is_player_role(role_text))
+                used_names.add(nkey)
+                role_flags.setdefault(nkey, is_player_role(role_text, disp_name))
 
             if not table.empty:
                 for _, row in table.iterrows():
@@ -433,37 +444,37 @@ async def collect_events_and_attendance() -> Tuple[List[str], Dict[str, Dict[str
                     if not name: 
                         continue
                     nkey = normalize_name(name)
-                    # capture relevance from XLSX role if we haven’t seen the name
-                    if nkey not in global_role_flags:
-                        role_guess = ""
-                        if nkey in x_roles: role_guess = x_roles[nkey]
-                        global_role_flags[nkey] = is_player_role(role_guess)
-
+                    if nkey not in role_flags:
+                        role_flags[nkey] = is_player_role(x_roles.get(nkey,""), name)
                     if nkey in used_names:
-                        continue  # JSON already provided a status
+                        continue  # JSON already set
                     raw_st = str(row.get("Raw Status","")).strip()
                     raw_re = str(row.get("Raw Reason","")).strip()
                     txt, code = status_to_cell(raw_st, raw_re)
                     per_member.setdefault(name, {})[header] = (txt, code)
 
-        # Keep only relevant members (players)
-        # Build a map display_name -> relevance by looking up normalized name
-        relevant_map: Dict[str,bool] = {}
-        for disp in list(per_member.keys()):
+        # Filter to players (and optional allowlist)
+        allow = load_allowlist()
+        filtered: Dict[str, Dict[str, Tuple[str, str]]] = {}
+        for disp, events in per_member.items():
             nkey = normalize_name(disp)
-            relevant = global_role_flags.get(nkey, True)  # default True if unknown
-            # extra safety: exclude if name contains leader/coach/admin etc
-            nm = disp.lower()
-            if any(w in nm for w in ROLE_EXCLUDE_WORDS):
-                relevant = False
-            relevant_map[disp] = relevant
+            if allow is not None:
+                if nkey in allow:
+                    filtered[disp] = events
+            else:
+                if role_flags.get(nkey, True):
+                    filtered[disp] = events
 
-        # prune non-players
-        for disp in list(per_member.keys()):
-            if not relevant_map.get(disp, True):
-                per_member.pop(disp, None)
+        # Expose relevance for debug
+        relevance = {}
+        if allow is not None:
+            for disp in per_member.keys():
+                relevance[disp] = normalize_name(disp) in allow
+        else:
+            for disp in per_member.keys():
+                relevance[disp] = role_flags.get(normalize_name(disp), True)
 
-        return event_headers, per_member, dbg, relevant_map
+        return event_headers, filtered, dbg, relevance
 
     finally:
         try:
@@ -550,7 +561,7 @@ def write_wide_sheet(sh, ws_att, event_headers: List[str], values: List[List[str
         for i in range(0, len(requests), 5000):
             sh.batch_update({"requests": requests[i:i+5000]})
 
-    log("Attendance sheet updated (players only).")
+    log("Attendance sheet updated.")
 
 def write_debug(ws_dbg, dbg_rows: List[Dict[str, Any]], relevance: Dict[str,bool]):
     cols = ["Event ID","Event Title","Start UTC","Matched (details/xlsx)","Cutoff Date OK","Included"]
@@ -558,7 +569,6 @@ def write_debug(ws_dbg, dbg_rows: List[Dict[str, Any]], relevance: Dict[str,bool
     data = [cols] + [[r.get(c,"") for c in cols] for r in dbg_rows] if dbg_rows else [cols, ["(no events)", "", "", "", "", ""]]
     ws_dbg.update(data)
 
-    # small appendix showing who was filtered out as non-player
     if relevance:
         keep = sorted([n for n, ok in relevance.items() if ok])
         drop = sorted([n for n, ok in relevance.items() if not ok])
