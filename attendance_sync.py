@@ -201,7 +201,7 @@ def read_attendance_xlsx(xbytes: bytes) -> pd.DataFrame:
 
     frames: List[pd.DataFrame] = []
     for _, df in (sheets or {}).items():
-        if df is None or df.empty: 
+        if df is None or df.empty:
             continue
         df = df.copy()
         df.columns = [str(c).strip() for c in df.columns]
@@ -232,7 +232,8 @@ def read_attendance_xlsx(xbytes: bytes) -> pd.DataFrame:
 def extract_statuses_from_json(ev: Dict[str,Any]) -> Dict[str,str]:
     """
     Return norm_name -> 'Present' | 'Absent' | 'No response'
-    Scans common arrays and fields.
+    Scans common arrays and fields. If an entry has a nested 'member' object,
+    we use that member's name (guardian responding on behalf of the child).
     """
     by_name: Dict[str,str] = {}
 
@@ -242,30 +243,37 @@ def extract_statuses_from_json(ev: Dict[str,Any]) -> Dict[str,str]:
         if isinstance(v, list): arrays.append(v)
 
     def get_stat(p: Dict[str,Any]) -> Optional[str]:
-        # look through common keys
         for k in ("status","response","rsvpStatus","attendanceStatus","answer","state"):
             if k in p and p[k] is not None:
-                st = normalize_status(p[k])
-                return st
-        # boolean hints
+                return normalize_status(p[k])
         if str(p.get("isAttending","")).lower() in {"true","1"}: return "Present"
         if str(p.get("declined","")).lower() in {"true","1"}:    return "Absent"
         return None
 
+    def get_display_name(p: Dict[str,Any]) -> str:
+        # Prefer explicit member name if present (guardian on behalf of member)
+        m = p.get("member") or p.get("participant") or p.get("child") or p.get("forMember")
+        if isinstance(m, dict):
+            n2 = _pick(m, "name","fullName","memberName","title","displayName")
+            if n2: return str(n2).strip()
+        # Fallback to the object name
+        n1 = _pick(p, "name","fullName","memberName","title","displayName")
+        return str(n1 or "").strip()
+
     for arr in arrays:
         for p in arr:
-            name = _pick(p, "name","fullName","memberName","title","displayName") or ""
-            name = str(name).strip()
+            name = get_display_name(p)
             if not name: continue
-            st = get_stat(p)
-            if st is None:
-                # sometimes nested like {"member": {"name": ...}, "status": ...}
-                m = p.get("member") or p.get("participant")
-                if isinstance(m, dict):
-                    nm2 = str(_pick(m, "name","fullName","memberName","title","displayName") or "").strip()
-                    if nm2: name = nm2
-                st = get_stat(p) or "No response"
+            st = get_stat(p) or "No response"
             by_name[key_name(name)] = st
+
+            # If object includes a string like "Guardian for <Child>", try to extract child too
+            blob = " ".join([to_text(v) for v in p.values() if v is not None])
+            m = re.findall(r"\((?:for|guardian\s*for)\s*([^)]+)\)", blob, flags=re.I)
+            for child in m:
+                child = child.strip()
+                if child:
+                    by_name[key_name(child)] = st
 
     return by_name
 
@@ -336,7 +344,7 @@ async def collect_events_and_attendance() -> Tuple[List[str], Dict[str, Dict[str
 
         for le in events:
             eid = _pick(le, "id","eventId","uid")
-            if not eid: 
+            if not eid:
                 continue
             try:
                 ev = await sp.get_event(eid)
@@ -387,20 +395,47 @@ async def collect_events_and_attendance() -> Tuple[List[str], Dict[str, Dict[str
         per_member: Dict[str, Dict[str, Tuple[str, str]]] = {canon: {} for canon in (roster.values() or [])}
         name_hits = {"matched": {}, "unmatched": set()}  # for debug
 
+        # --- enhanced mapping to roster (guardian -> child) ---
+        roster_norm_to_canon = dict(roster)  # normalized -> canonical
+        roster_norms = list(roster_norm_to_canon.keys())
+
         def map_to_roster(display_name: str) -> Optional[str]:
-            nk = key_name(display_name)
-            if roster:
-                canon = roster.get(nk)
-                if canon:
-                    name_hits["matched"][canon] = name_hits["matched"].get(canon, 0) + 1
-                else:
-                    name_hits["unmatched"].add(display_name)
+            """
+            1) Exact normalized match.
+            2) If not exact: try to find exactly one roster full-name contained
+               in the display string (including parentheses), case-insensitive.
+               Example: "Jane Doe (for Adrian Jekteberg)" -> Adrian Jekteberg
+            """
+            if not display_name:
+                return None
+            s_clean = key_name(display_name)
+            # exact
+            canon = roster_norm_to_canon.get(s_clean)
+            if canon:
+                name_hits["matched"][canon] = name_hits["matched"].get(canon, 0) + 1
                 return canon
-            # If no roster provided, fall back to using cleaned name
-            return display_name
+
+            # search inside raw and parentheses content
+            raw_cf = re.sub(r"\s+", " ", display_name).strip().casefold()
+            parens = " ".join(re.findall(r"\((.*?)\)", display_name))  # content inside ()
+            parens_cf = parens.casefold()
+
+            found: List[str] = []
+            for rn, canon_name in roster_norm_to_canon.items():
+                # rn is normalized full name (casefolded, no parens). Build a lenient token
+                # Also check canonical as casefolded full string to catch accents properly.
+                canon_cf = canon_name.casefold()
+                if rn in s_clean or canon_cf in raw_cf or canon_cf in parens_cf:
+                    found.append(canon_name)
+            if len(found) == 1:
+                name_hits["matched"][found[0]] = name_hits["matched"].get(found[0], 0) + 1
+                return found[0]
+            # ambiguous or none
+            name_hits["unmatched"].add(display_name)
+            return None
 
         for (eid, header, _) in included:
-            # 1) JSON statuses
+            # 1) JSON statuses (already tries to use member if guardian responded)
             json_status_by_norm: Dict[str,str] = {}
             try:
                 ev = await sp.get_event(eid)
@@ -416,7 +451,7 @@ async def collect_events_and_attendance() -> Tuple[List[str], Dict[str, Dict[str
             except Exception:
                 pass
 
-            # Build a temp map display_name -> (status, reason)
+            # Build a temp map display_name_or_norm -> (status, reason)
             tmp: Dict[str, Tuple[str,str]] = {}
 
             # Prefer XLSX (more reliable), then JSON fill-ins
@@ -424,30 +459,26 @@ async def collect_events_and_attendance() -> Tuple[List[str], Dict[str, Dict[str
                 for _, r in xdf.iterrows():
                     nm = str(r["Member"]).strip()
                     st = str(r["Status"]).strip()
-                    rs = str(r.get("Reason","")).strip()
+                    rs = str(r.get("Reason","")).strip() if "Reason" in r else ""
                     tmp[nm] = status_to_cell(st, rs)
+
             # Fill from JSON if missing
             for n_norm, st in json_status_by_norm.items():
-                # We don't know the exact display form here, so store only if we don't already have XLSX
-                # This will be mapped via roster below.
-                # Keep reason empty for JSON.
                 tmp.setdefault(n_norm, status_to_cell(st, ""))
 
-            # Map tmp -> canonical roster names
+            # Map tmp -> canonical roster names (with guardian->child handling)
             for name_like, (txt, code) in tmp.items():
                 canon = map_to_roster(name_like)
                 if not canon:
-                    # If roster enforced and this name isn't on it, skip
                     continue
                 per_member.setdefault(canon, {})
                 per_member[canon][header] = (txt, code)
 
-        # If roster is enforced, ensure everyone appears even if no data
+        # Ensure everyone in roster appears
         if roster:
             for canon in roster.values():
                 per_member.setdefault(canon, {})
 
-        # Build relevance/debug info
         dbg_info = {
             "Roster size": len(roster) if roster else "(no roster enforced)",
             "Matched names": len(name_hits["matched"]),
