@@ -3,7 +3,7 @@ name: Spond Attendance Sync
 on:
   schedule:
     - cron: "0 * * * *"   # every hour
-  workflow_dispatch:
+  workflow_dispatch:       # allow manual run
 
 jobs:
   sync:
@@ -25,9 +25,10 @@ jobs:
       - name: Run sync
         env:
           PYTHONUNBUFFERED: "1"
-          TIMEZONE: "Europe/Oslo"   # used when parsing dates from XLSX header text
+          TIMEZONE: Europe/Oslo
           SPOND_USERNAME: ${{ secrets.SPOND_USERNAME }}
           SPOND_PASSWORD: ${{ secrets.SPOND_PASSWORD }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          PLAYER_ALLOWLIST: ${{ secrets.PLAYER_ALLOWLIST }}
         run: python attendance_sync.py
