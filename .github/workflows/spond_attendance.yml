@@ -1,16 +1,15 @@
-name: Attendance Sync
+name: Spond Attendance Sync
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # every day at 06:00 UTC
-  workflow_dispatch:       # allow manual trigger
+    - cron: "0 * * * *"   # every hour
+  workflow_dispatch:       # allow manual run
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repo
+      - name: Check out repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -21,14 +20,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install spond gspread google-auth google-auth-oauthlib pandas openpyxl python-dateutil
+          pip install spond gspread google-auth pandas openpyxl python-dateutil
 
-      - name: Run attendance sync
-        env:
-          SPOND_USERNAME: ${{ secrets.SPOND_USERNAME }}
-          SPOND_PASSWORD: ${{ secrets.SPOND_PASSWORD }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SHEET_ID: ${{ secrets.SHEET_ID }}
       - name: Run sync
         env:
           PYTHONUNBUFFERED: "1"
@@ -39,4 +32,5 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           PLAYER_ALLOWLIST: ${{ secrets.PLAYER_ALLOWLIST }}
         run: python attendance_sync.py
+
 
